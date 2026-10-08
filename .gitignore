@@ -1,0 +1,29 @@
+# Local environments and Python caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated conversion output, local source documents and scratch files
+/output/
+/transfer_kenel/output/
+/transfer_kenel/tmp/
+/tmp/
+*.pdf
+
+# Local secrets and editor/OS state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
