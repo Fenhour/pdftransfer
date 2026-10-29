@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#172c38">
+  <title>纸序 Paperform · PDF OCR 解析器</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/progress.css">
+</head>
+<body>
+  <aside class="rail">
+    <a class="brand" href="#" aria-label="纸序首页"><svg viewBox="0 0 32 32" fill="none"><path d="M7 5h13l6 6v16H7z" stroke="currentColor" stroke-width="2"/><path d="M19 5v8h7M12 18h9M12 23h6" stroke="currentColor" stroke-width="2"/></svg></a>
+    <span class="brand-caption">纸序</span>
+    <nav>
+      <button class="rail-button active" data-screen="input" title="导入文件"><span data-icon="inbox"></span><span>导入</span></button>
+      <button class="rail-button" data-screen="editor" title="页面编辑"><span data-icon="layers"></span><span>编辑</span></button>
+      <button class="rail-button" data-screen="output" title="导出成果"><span data-icon="export"></span><span>输出</span></button>
+    </nav>
+    <div class="rail-bottom"><span class="local-dot"></span><span>本地运行</span></div>
+  </aside>
+  <div class="app">
+    <header class="topbar">
+      <div class="breadcrumb"><strong>Paperform</strong><span class="crumb-divider">/</span><span id="screen-label">文件工作台</span></div>
+      <div class="topbar-end"><span class="privacy"><span data-icon="shield"></span>文件仅保存在本机</span><span class="avatar">P</span></div>
+    </header>
+    <main id="input-screen" class="screen input-screen">
+      <div class="page-heading"><div><div class="eyebrow">YOUR DOCUMENTS, REIMAGINED</div><h1>让每一页，重新可编辑<span class="teal-dot">。</span></h1><p>编辑页面、提取阅读内容，或识别扫描文字；复杂图文区域整体保留为图片。</p></div><div class="version-tag"><span class="local-dot"></span> 本地解析工作台 <span>01</span></div></div>
+      <div class="import-grid">
+        <section class="upload-card">
+          <div class="section-heading"><h2><span class="number-label">01</span> 导入你的文件</h2><span id="file-types-label" class="subtle">PDF / IMAGE / JSON</span></div>
+          <fieldset class="import-mode-picker" id="import-mode-picker">
+            <legend>选择处理方式</legend>
+            <div class="import-modes">
+              <label class="import-mode-card"><input type="radio" name="import-mode" value="html" data-import-mode="html"><span><strong><span class="import-mode-number" aria-hidden="true">01</span>PDF → HTML（阅读）</strong><small>阅读型网页、图片资源与源 PDF</small></span></label>
+              <label class="import-mode-card"><input type="radio" name="import-mode" value="md" data-import-mode="md"><span><strong><span class="import-mode-number" aria-hidden="true">02</span>PDF → MD（阅读）</strong><small>Markdown、图片资源与源 PDF</small></span></label>
+              <label class="import-mode-card"><input type="radio" name="import-mode" value="editor" data-import-mode="editor" checked><span><strong><span class="import-mode-number" aria-hidden="true">03</span>OCR 解析与画布编辑</strong><small>版面、文字与表格识别，校对页面布局</small></span></label>
+              <label class="import-mode-card"><input type="radio" name="import-mode" value="text_pdf" data-import-mode="text_pdf"><span><strong><span class="import-mode-number" aria-hidden="true">04</span>图片 / PDF → 结构化重建</strong><small>真实文字、简单表格与完整图文区域</small></span></label>
+              <label class="import-mode-card"><input type="radio" name="import-mode" value="detection" data-import-mode="detection"><span><strong><span class="import-mode-number" aria-hidden="true">05</span>单步检测预览</strong><small>文字行、类别框或大区域框，标注后在画布查看</small></span></label>
+            </div>
+          </fieldset>
+          <div id="detection-options" class="page-range-option hidden"><label for="detection-model">检测模型</label><select id="detection-model"><option value="det">文字行 · PP-OCRv5_server_det</option><option value="layout" selected>类别框 · PP-DocLayout_plus-L</option><option value="region">大区域 · PP-DocBlockLayout</option></select><p>只运行所选检测模型；边框保留原始类别。完成后在页面编辑器查看，可导出 PDF。</p></div>
+          <p id="import-mode-description" class="import-mode-description">使用现有 OCR 解析器处理 PDF、图片，或恢复项目 JSON；进入画布编辑文字、图片与页面布局。</p>
+          <div id="dropzone" class="dropzone" role="button" tabindex="0" aria-label="选择或拖入 PDF 和图片">
+            <div class="document-art" aria-hidden="true"><div class="art-page back"></div><div class="art-page front"><div class="art-top"></div><span></span><span></span><div class="art-chart"><i></i><i></i><i></i></div><div class="art-plus">+</div></div></div>
+            <h3>把文件拖到这里</h3><p>或从你的电脑中选择文件</p>
+            <button class="button primary" id="choose-files"><span data-icon="plus"></span> 选择文件</button>
+            <div id="file-formats" class="formats">PDF · PNG · JPG · TIFF · WebP · BMP · JSON <span>支持多文件、多页文档 · JSON 可恢复编辑项目</span></div>
+          </div>
+          <input type="file" id="file-input" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.webp,.bmp,.json" multiple hidden>
+          <div id="pending-files" class="pending-files"></div>
+          <div class="page-range-option"><label for="page-range">物理页码 <span>可选</span></label><input type="text" id="page-range" name="pages" placeholder="全部页面，例如 1-3,5,8-10" aria-describedby="page-range-help" autocomplete="off" spellcheck="false"><p id="page-range-help">留空处理全部页面；按文件实际顺序从 1 开始，不是印刷页码。</p></div>
+          <div id="rebuild-options" class="page-range-option hidden"><label for="rebuild-format">重建输出</label><select id="rebuild-format" aria-describedby="rebuild-format-help"><option value="pdf">PDF · 可编辑文字与自适应分页</option><option value="html">HTML ZIP · 重建布局与表格单元格</option><option value="md">Markdown ZIP · 阅读顺序与表格</option></select><p id="rebuild-format-help">按类别解析文字、表格与图片，先调整块内排版，再按阅读关系重排和分页；页数与原版面可能变化。图片保留原图，表格附原图参考，不可靠结构会标记。每次只生成所选格式，结果需校对。</p></div>
+          <div class="upload-footer"><label class="switch-label"><input type="checkbox" id="ocr-toggle" aria-describedby="ocr-help" checked><span class="switch"></span><span id="ocr-label">识别扫描件中的文字</span></label><span id="ocr-status" class="subtle">正在检查解析引擎…</span></div>
+          <p id="ocr-help" class="import-option-help">扫描内容可启用本地 OCR，识别结果仍需校对。</p>
+          <p id="import-error" class="import-error hidden" role="alert" data-import-error></p>
+          <button class="button primary parse-button" id="parse-files" disabled><span data-icon="scan"></span><span id="parse-label">解析并打开编辑器</span><span data-icon="arrow-right"></span></button>
+          <section id="reading-result" class="reading-result hidden" aria-live="polite" role="status" data-reading-result>
+            <h3 id="reading-result-title">转换完成</h3><p id="reading-result-description"></p>
+            <a id="reading-download" class="button secondary small" data-reading-download><span data-icon="download"></span><span id="reading-download-label">重新下载 ZIP</span></a>
+          </section>
+        </section>
+        <aside class="intro-card">
+          <div class="eyebrow">BEYOND TEXT RECOGNITION</div><h2>从一页原稿<br>到下一步工作</h2>
+          <div class="feature"><span class="feature-icon" data-icon="layout"></span><div><h3>复杂图文，整块保留</h3><p>复杂区域以图片保留，供对照<br>不自动拆分或提取其中的图案。</p></div></div>
+          <div class="feature"><span class="feature-icon" data-icon="cursor"></span><div><h3>识别之后，继续校对</h3><p>在画布修改文字与调整图片<br>识别结果可与原稿对照。</p></div></div>
+          <div class="feature"><span class="feature-icon" data-icon="code"></span><div><h3>阅读结果，打包带走</h3><p>HTML / Markdown ZIP 包含<br>阅读文档、图片资源与源 PDF。</p></div></div>
+          <div class="demo-card"><div><span class="demo-kicker">先看看效果</span><strong>一页文档的全新可能</strong></div><button id="load-demo" class="icon-button" title="打开示例文档" aria-label="打开示例文档"><span data-icon="arrow-right"></span></button></div>
+        </aside>
+      </div>
+      <section class="recent-section"><div class="section-heading"><h2>最近的文档 <span class="count" id="recent-count">0</span></h2><button id="refresh-documents" class="text-button"><span data-icon="refresh"></span>刷新</button></div><div id="recent-documents" class="recent-documents"><div class="empty-recent"><span data-icon="folder"></span><span>你的文档会保存在这里，随时回来继续编辑。</span></div></div></section>
+      <footer class="workspace-footer"><span>保留原貌 · 自由编辑 · 数据可追溯</span><span>MADE FOR THE DETAILS</span></footer>
+    </main>
+    <main id="editor-screen" class="screen editor-screen hidden">
+      <div class="document-bar"><div class="document-name-group"><span class="file-badge" data-icon="file"></span><div><input id="document-name" aria-label="文档名称" maxlength="500"><span id="document-meta"></span></div></div><div class="document-actions"><span id="save-state" class="save-state">已保存</span><button id="json-open" class="button secondary small"><span data-icon="code"></span>数据</button><button id="go-output" class="button primary small"><span data-icon="export"></span>导出文档</button></div></div>
+      <div class="editor-toolbar"><div class="toolbar-group"><button id="undo" class="icon-button" title="撤销 Ctrl+Z"><span data-icon="undo"></span></button><button id="redo" class="icon-button" title="重做 Ctrl+Shift+Z"><span data-icon="redo"></span></button><i class="toolbar-divider"></i><button id="add-text" class="tool-button"><span data-icon="text"></span>文字</button><button id="add-shape" class="tool-button"><span data-icon="square"></span>图形</button><button id="add-image" class="tool-button"><span data-icon="image"></span>图片</button><input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/bmp" hidden></div><div class="toolbar-group"><button id="compare-toggle" class="tool-button" aria-pressed="false"><span data-icon="compare"></span>查看原稿</button><i class="toolbar-divider"></i><button id="zoom-out" class="icon-button" title="缩小"><span data-icon="minus"></span></button><button id="zoom-fit" class="zoom-label" title="适合窗口">100%</button><button id="zoom-in" class="icon-button" title="放大"><span data-icon="plus"></span></button></div></div>
+      <div class="editor-layout">
+        <aside class="layers-panel"><div class="panel-tabs"><button class="active" data-left-tab="pages">页面</button><button data-left-tab="layers">图层 <span id="layer-count"></span></button></div><div id="pages-list" class="pages-list"></div><div id="layers-list" class="layers-list hidden"></div><div class="panel-bottom"><span data-icon="info"></span><span id="page-summary"></span></div></aside>
+        <div class="canvas-wrap" id="canvas-wrap"><div class="canvas-context"><span id="canvas-page-name">页面 01</span><span id="compare-label" class="hidden">原稿预览 · 返回编辑以修改元素</span></div><div class="canvas-stage" id="canvas-stage"><div class="page-canvas" id="page-canvas"></div></div><div class="canvas-empty hidden" id="canvas-empty">从左侧选择一个页面</div></div>
+        <aside class="properties-panel"><div class="panel-title">属性 <span id="selection-type">未选择元素</span></div><div id="properties-content"></div></aside>
+      </div>
+      <div class="editor-status"><span id="editor-hint">点击选择元素 · 双击修改文字 · 拖动调整位置</span><span><span class="local-dot"></span> <span id="sync-label">画布与 JSON 实时同步</span></span></div>
+    </main>
+    <main id="output-screen" class="screen output-screen hidden">
+      <div class="page-heading"><div><div class="eyebrow">READY FOR WHAT’S NEXT</div><h1>你的文档，准备就绪<span class="teal-dot">。</span></h1><p>每一处修改都已同步到数据模型。选择适合下一步工作的格式。</p></div><button id="back-editor" class="button secondary"><span data-icon="arrow-left"></span>继续编辑</button></div>
+      <div id="output-summary" class="output-summary"></div>
+      <div class="export-grid">
+        <button class="export-card" data-export="pdf"><span class="export-icon coral" data-icon="file"></span><span class="format-title">视觉 PDF <small>页面图像</small></span><span class="export-desc">将画布渲染为页面图像<br>内嵌项目数据，可重新导入编辑</span><span class="export-bottom">导出视觉 PDF <span data-icon="download"></span></span></button>
+        <button class="export-card text-pdf-export" data-export="pdf-text"><span class="export-icon mint" data-icon="text"></span><span class="format-title">可编辑文本 PDF</span><span class="export-desc">正文为可编辑、可搜索、可选择的真实文字；复杂图文区域整体保留为图片。请先校对，不自动提取图案。</span><span class="export-bottom">导出可编辑文本 PDF <span data-icon="download"></span></span></button>
+        <button class="export-card" data-export="json"><span class="export-icon mint" data-icon="code"></span><span class="format-title">JSON <small>结构数据</small></span><span class="export-desc">坐标、样式与全部页面元素<br>适合二次开发与数据处理</span><span class="export-bottom">导出 JSON <span data-icon="download"></span></span></button>
+        <button class="export-card" data-export="html"><span class="export-icon blue" data-icon="layout"></span><span class="format-title">HTML <small>网页预览</small></span><span class="export-desc">浏览器可直接打开的文档<br>保留绝对坐标与页面结构</span><span class="export-bottom">导出 HTML <span data-icon="download"></span></span></button>
+        <button class="export-card" data-export="zip"><span class="export-icon sand" data-icon="folder"></span><span class="format-title">ZIP <small>完整归档</small></span><span class="export-desc">合并结果与分类素材打包<br>一次保存整个项目</span><span class="export-bottom">下载项目 <span data-icon="download"></span></span></button>
+      </div>
+      <div class="output-detail-grid"><section class="storage-card"><div class="section-heading"><h2>有序的文件，清晰的结果</h2><span class="subtle">LOCAL STORAGE</span></div><div class="storage-tree"><div><span data-icon="folder"></span><strong>input /</strong><span>原始上传文件</span></div><div><span data-icon="folder"></span><strong>output / 文档 ID /</strong><span>解析与编辑成果</span></div><div class="tree-children"><span>text</span><span>images</span><span>vectors</span><span>backgrounds</span><span>pages</span><span>exports</span><span class="summary-folder">summary · 合并结果</span></div></div></section><section class="review-card"><h2><span data-icon="scan"></span>解析说明</h2><div id="output-warnings"></div></section></div>
+    </main>
+  </div>
+  <div id="busy-overlay" class="busy-overlay hidden" role="status" aria-live="polite"><div class="busy-card"><div class="scan-loader"><span></span><span></span><span></span></div><h2 id="busy-title">正在处理你的文档</h2><p id="busy-message">识别文字、保留复杂图文区域，处理时间取决于页面内容。</p><div class="operation-progress"><div class="progress-heading"><span id="busy-stage">准备处理</span><strong id="busy-percent">准备中</strong></div><progress id="busy-progress" max="100" aria-label="处理进度"></progress><div class="progress-details"><span id="busy-progress-detail"></span><span id="busy-elapsed">已用时 0:00</span></div></div><div class="busy-steps"><span>读取页面</span><i></i><span>处理内容</span><i></i><span>生成结果</span></div><p class="busy-note">处理时间取决于文件页数与 OCR；请保持此页面打开。</p></div></div>
+  <dialog id="json-dialog"><div class="dialog-head"><div><h2>文档数据</h2><p>编辑 JSON 后应用到画布，所有页面将同步更新。</p></div><button id="json-close" class="icon-button" aria-label="关闭"><span data-icon="close"></span></button></div><textarea id="json-editor" spellcheck="false" aria-label="文档 JSON 数据"></textarea><div id="json-error" class="json-error"></div><div class="dialog-footer"><button id="json-copy" class="button secondary">复制 JSON</button><button id="json-apply" class="button primary">验证并应用</button></div></dialog>
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/progress.js?v=20261028-detection"></script>
+  <script src="/app.js?v=20261028-detection"></script>
+</body>
+</html>

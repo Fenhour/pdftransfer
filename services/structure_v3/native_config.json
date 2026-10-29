@@ -1,0 +1,18 @@
+{
+  "model_dir": "../../V3/models",
+  "model_paths": {
+    "PP-OCRv5_server_rec": "PP-OCRv5_server_rec_cpu_fp32_zero_subnormals_v1_63853f062a5f",
+    "PP-OCRv5_server_det": "PP-OCRv5_server_det_cpu_fp32_zero_subnormals_v1_183146fe9d99"
+  },
+  "results_dir": "../../tmp/v3-native-results",
+  "cache_version": "1",
+  "cpu_threads": 6,
+  "device": "cpu",
+  "enable_mkldnn": true,
+  "use_doc_orientation_classify": false,
+  "use_doc_unwarping": false,
+  "use_textline_orientation": false,
+  "use_formula_recognition": false,
+  "use_chart_recognition": false,
+  "use_seal_recognition": false
+}

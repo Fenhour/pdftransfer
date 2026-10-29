@@ -1,0 +1,4 @@
+# Keep the tested model/pipeline and CPU runtime versions aligned.
+paddlepaddle==3.2.2
+paddleocr==3.7.0
+paddlex[ocr]==3.7.2

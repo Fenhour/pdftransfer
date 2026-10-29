@@ -1,0 +1,10 @@
+pymupdf==1.28.2
+fastapi==0.143.1
+uvicorn==0.54.0
+python-multipart==0.0.32
+Pillow>=11,<13
+numpy>=2,<3
+opencv-python>=4.10,<6
+rapidocr-onnxruntime==1.4.4
+fonttools>=4.58,<5
+

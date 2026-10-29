@@ -1,0 +1,5 @@
+{
+  "port": 8765,
+  "max_upload_mb": 256,
+  "recognition_backend": "v3"
+}

@@ -1,0 +1,12 @@
+{
+  "release": "v2.2026.10.28-internal-structure",
+  "date": "2026-10-28",
+  "components": {
+    "det": "det-fp32-zero-subnormals-v1",
+    "rec": "rec-fp32-zero-subnormals-v1",
+    "relations": "07-spatial-v2",
+    "layout": "08-regional-v4-internal-structure",
+    "layoutPolicy": "source-preserving-regions-v1",
+    "internalLayout": "source-lines-and-cell-anchors-v1"
+  }
+}
