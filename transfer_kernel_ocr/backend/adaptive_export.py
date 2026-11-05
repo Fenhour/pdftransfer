@@ -7,7 +7,9 @@ visible copy of successfully reconstructed text or tables.
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 import html
+import io
 import json
 import math
 from pathlib import Path
@@ -20,6 +22,7 @@ import pymupdf as fitz
 from .font_library import get_library
 from .pdf_safety import save_verified, validate_pdf
 from .usage import tracked
+from .regional_layout import RegionLayoutError, recoverable_geometry_error
 
 
 def _json(value):
@@ -82,7 +85,15 @@ def _validate_lines(measured):
         baseline = float(line['baseline'])
         if not all(math.isfinite(v) for v in (size, x, baseline)) or size <= 0:
             raise ValueError('文字测量坐标无效')
-        if (x < -.05 or x + font.text_length(line['text'], fontsize=size) > measured['width'] + .05 or
+        runs = line.get('text_runs')
+        advance = font.text_length(line['text'],fontsize=size)
+        if runs is not None:
+            if _nonspace(''.join(r['text'] for r in runs)) != _nonspace(line['text']):
+                raise ValueError('间距排版文字范围不一致')
+            if any(not math.isfinite(float(r['x'])) or r['x']<-.05 for r in runs):
+                raise ValueError('间距排版位置无效')
+            advance=max((r['x']+font.text_length(r['text'],fontsize=size) for r in runs),default=0.)
+        if (x < -.05 or x + advance > measured['width'] + .05 or
                 baseline - font.ascender * size < -.05 or
                 baseline - font.descender * size > measured['height'] + .05):
             raise ValueError('文字测量结果溢出内容块，未裁掉文字')
@@ -95,7 +106,7 @@ def _walk_blocks(blocks):
         yield from _walk_blocks(block.get('content',{}).get('children',[]))
 
 
-def _validate_composite(block, measured):
+def _validate_composite(block, measured, *, preserve_overlap=False):
     children={c['id']:c for c in block['content'].get('children',[])}
     values=measured.get('children',[])
     if not children or Counter(v['block_id'] for v in values)!=Counter(children.keys()):
@@ -121,6 +132,7 @@ def _validate_composite(block, measured):
     if not math.isfinite(border) or border<0:
         raise ValueError('组合块边框无效')
     previous=[]
+    collisions=[]
     for value in values:
         child=children[value['block_id']];m=value['measurement']
         if child['kind']!='text':raise ValueError('组合块子块类型无效')
@@ -130,12 +142,16 @@ def _validate_composite(block, measured):
         if (not all(math.isfinite(v) for v in (x,y,w,h)) or min(x,y)<0 or min(w,h)<=0 or
                 x+w>measured['width']+.05 or y+h>measured['height']+.05):
             raise ValueError('组合块子块越界')
-        for a,b,c,d in previous:
+        for previous_id,a,b,c,d in previous:
             if max(0,min(x+w,c)-max(x,a))*max(0,min(y+h,d)-max(y,b))>.05:
-                raise ValueError('组合块子块发生重叠')
-        previous.append((x,y,x+w,y+h))
+                if not preserve_overlap:
+                    raise ValueError('组合块子块发生重叠')
+                collisions.append(dict(block_ids=[previous_id, value['block_id']],
+                    bboxes=[[a,b,c,d],[x,y,x+w,y+h]]))
+        previous.append((value['block_id'],x,y,x+w,y+h))
         _validate_lines(m)
         _validate_source_lines(m.get('lines',[]),child['content'].get('text',''))
+    return collisions
 
 
 def _validate_region_frames(project, layout, page_by_index):
@@ -161,7 +177,8 @@ def _validate_region_frames(project, layout, page_by_index):
         x0, y0, x1, y1 = box
         if (min(x0, y0) < -.02 or x1 <= x0 or y1 <= y0 or
                 x1 > page['width']+.02 or y1 > page['height']+.02):
-            raise ValueError('区域边界越出目标页面')
+            source = next(p for p in project['source_pages'] if p['id'] == page['source_page_id'])
+            raise RegionLayoutError('区域边界越出目标页面', frame, source)
         if (frame.get('source_page_id') is not None and
                 frame['source_page_id'] != page['source_page_id']):
             raise ValueError('区域边界的源页归属与目标页不一致')
@@ -228,6 +245,19 @@ def _owned_alpha_overlap(first, second, by_id, root):
 
 
 def _validate(project, root=None):
+    from .source_containment import source_contains_pair
+    for source in project.get('source_pages', []):
+        background = source.get('background')
+        if background:
+            if (background.get('coordinate_space') != 'source-page-points' or
+                    background.get('bbox_pt') != [0., 0., source['width_pt'], source['height_pt']] or
+                    background.get('participates_in_layout') is not False):
+                raise ValueError('页面背景坐标或布局属性无效')
+            if root is not None:
+                from PIL import Image
+                with Image.open(_asset(root, background['asset'])) as image:
+                    if list(image.size) != background.get('pixel_size'):
+                        raise ValueError('页面背景像素尺寸不匹配')
     blocks = project.get('blocks', [])
     by_id = {b['id']: b for b in blocks}
     if len(by_id) != len(blocks):
@@ -243,101 +273,144 @@ def _validate(project, root=None):
     if set(page_by_index) != set(range(len(pages))):
         raise ValueError('目标页面索引必须连续且唯一')
     frames = _validate_region_frames(project, layout, page_by_index)
+    preserve_overlap = (frames is not None and project.get('layout_options', {}).get(
+        'text_adaptation_version') in {'20261103', '20261104'})
+
+    def retain_overlap(placement, reason, details):
+        frame = frames[placement['frame_id']]
+        source = next(s for s in project['source_pages'] if s['id']==frame['source_page_id'])
+        placement['unresolved_geometry'] = True
+        issue = dict(frame_id=frame['id'], block_id=placement['block_id'],
+            source_page_id=source['id'], physical_page_number=source.get('physical_page_index',0)+1,
+            reason=reason, action='export-current-geometry-and-continue', collisions=details)
+        issues = layout.setdefault('issues', [])
+        if any(i.get('block_id')==issue['block_id'] and i.get('reason')==reason for i in issues):
+            return
+        from .layout_pending import save_layout_issue
+        failure = RegionLayoutError(reason, frame, source)
+        failure.measurements = {placement['block_id']:deepcopy(placement['measurement'])}
+        failure.positions = {placement['block_id']:list(placement['bbox'][:2])}
+        failure.solver_diagnostics = dict(stage='export-overlap-check', collisions=details)
+        diagnostic = save_layout_issue(project, root, failure)
+        issue['diagnostic_asset'] = 'layout-diagnostics/'+diagnostic.name if diagnostic else None
+        issues.append(issue)
     seen = set()
     text_ranges = {}
     table_cells = {}
     image_counts = Counter()
     page_boxes = {}
     for p in layout.get('placements', []):
-        if p['fragment_id'] in seen or p['block_id'] not in by_id:
-            raise ValueError('重建片段 ID 重复或来源块不存在')
-        seen.add(p['fragment_id'])
-        page = page_by_index.get(p['page_index'])
-        if page is None:
-            raise ValueError('重建片段的目标页不存在')
-        box = p['bbox']
-        if len(box) != 4 or not all(math.isfinite(float(n)) for n in box):
-            raise ValueError('重建片段坐标无效')
-        x0, y0, x1, y1 = box
-        if min(x0, y0) < -.02 or x1 <= x0 or y1 <= y0 or x1 > page['width'] + .02 or y1 > page['height'] + .02:
-            raise ValueError('重建片段越出目标页面')
-        measured = p['measurement']
-        if abs(measured['width'] - (x1 - x0)) > .05 or abs(measured['height'] - (y1 - y0)) > .05:
-            raise ValueError('排版坐标与测量快照不一致')
-        block = by_id[p['block_id']]
-        if frames is not None:
+        try:
+            if p['fragment_id'] in seen or p['block_id'] not in by_id:
+                raise ValueError('重建片段 ID 重复或来源块不存在')
+            seen.add(p['fragment_id'])
+            page = page_by_index.get(p['page_index'])
+            if page is None:
+                raise ValueError('重建片段的目标页不存在')
+            box = p['bbox']
+            if len(box) != 4 or not all(math.isfinite(float(n)) for n in box):
+                raise ValueError('重建片段坐标无效')
+            x0, y0, x1, y1 = box
+            if min(x0, y0) < -.02 or x1 <= x0 or y1 <= y0 or x1 > page['width'] + .02 or y1 > page['height'] + .02:
+                raise ValueError('重建片段越出目标页面')
+            measured = p['measurement']
+            if abs(measured['width'] - (x1 - x0)) > .05 or abs(measured['height'] - (y1 - y0)) > .05:
+                raise ValueError('排版坐标与测量快照不一致')
+            block = by_id[p['block_id']]
+            if frames is not None:
+                frame = frames.get(p.get('frame_id'))
+                if frame is None or frame['page_index'] != p['page_index']:
+                    raise ValueError('重建片段的所属区域不存在或跨越目标页')
+                if block['source'].get('page_id') != page['source_page_id']:
+                    raise ValueError('保留源版面的内容块不得移到其他源页')
+                fx0, fy0, fx1, fy1 = frame['bbox']
+                if (x0 < fx0-.02 or y0 < fy0-.02 or x1 > fx1+.02 or y1 > fy1+.02) and not p.get('unresolved_geometry'):
+                    raise ValueError('重建片段越出所属区域边界')
+                if 'block_ids' in frame and p['block_id'] not in frame['block_ids']:
+                    raise ValueError('重建片段不属于当前区域')
+            for previous in page_boxes.setdefault(p['page_index'], []):
+                previous_box = previous['bbox']
+                overlap = max(0., min(x1, previous_box[2]) - max(x0, previous_box[0])) * max(0., min(y1, previous_box[3]) - max(y0, previous_box[1]))
+                if overlap > .05 and not (p.get('unresolved_geometry') or previous.get('unresolved_geometry')):
+                    if source_contains_pair(block, by_id[previous['block_id']]):
+                        continue
+                    if not (frames is not None and _preserved_owned_overlap(p, previous, by_id)):
+                        if not preserve_overlap:
+                            raise ValueError('自适应重建的内容块发生重叠')
+                        retain_overlap(p, '自适应重建的内容块发生重叠', [dict(
+                            block_ids=[previous['block_id'],p['block_id']],
+                            bboxes=[previous['bbox'],p['bbox']])])
+                    elif root is not None and not _owned_alpha_overlap(p, previous, by_id, root):
+                        if not preserve_overlap:
+                            raise ValueError('重叠区域的图片透明像素与归属证据不一致')
+                        retain_overlap(p, '重叠区域的图片透明像素与归属证据不一致', [dict(
+                            block_ids=[previous['block_id'],p['block_id']])])
+            page_boxes[p['page_index']].append(p)
+            if block['kind'] == 'text':
+                _validate_lines(measured)
+                content = block['content'].get('text', '')
+                r = p.get('content_range', {})
+                if not (0 <= r.get('start', -1) <= r.get('end', -1) <= len(content)):
+                    raise ValueError('文字片段内容范围无效')
+                _validate_source_lines(measured.get('lines', []), content, r['start'], r['end'])
+                text_ranges.setdefault(block['id'], []).append((r['start'], r['end']))
+            elif block['kind'] == 'table':
+                cells = {c['id']: c for c in block['content']['cells']}
+                if len(cells) != len(block['content']['cells']):
+                    raise ValueError('源表格单元格 ID 重复')
+                r = p.get('content_range', {})
+                first, last = r.get('row_start'), r.get('row_end')
+                if (not isinstance(first, int) or not isinstance(last, int) or
+                        not 0 <= first < last <= block['content']['row_count']):
+                    raise ValueError('表格片段行范围无效')
+                repeated, seen_cells = False, set()
+                for cell in measured.get('cells', []):
+                    if cell['id'] in seen_cells:
+                        raise ValueError('同一表格片段的单元格 ID 重复')
+                    seen_cells.add(cell['id'])
+                    if (min(cell['x'], cell['y']) < -.02 or cell['width'] <= 0 or cell['height'] <= 0 or
+                            cell['x'] + cell['width'] > measured['width'] + .05 or
+                            cell['y'] + cell['height'] > measured['height'] + .05):
+                        raise ValueError('单元格测量结果溢出表格片段')
+                    _validate_lines(cell)
+                    source = cells.get(cell['id'])
+                    if source is None:
+                        raise ValueError('表格片段包含未知单元格')
+                    if cell.get('text', '') != source.get('text', ''):
+                        raise ValueError('单元格测量快照与源内容不一致')
+                    _validate_source_lines(cell.get('lines', []), source.get('text', ''))
+                    if any(cell.get(k, 1) != source.get(k, 1) for k in ('row', 'column', 'rowspan', 'colspan')):
+                        raise ValueError('表格测量快照改变了单元格结构')
+                    if cell.get('repeat_header', False):
+                        repeated = True
+                        if (not p.get('repeat_header') or not source.get('header') or not cell.get('header') or
+                                first == 0 or source['row'] + source.get('rowspan', 1) > first):
+                            raise ValueError('重复表头标记只能用于续表中的源表头')
+                    else:
+                        if not first <= source['row'] < source['row'] + source.get('rowspan', 1) <= last:
+                            raise ValueError('普通单元格不属于当前表格片段行范围')
+                        table_cells.setdefault(block['id'], Counter())[cell['id']] += 1
+                if bool(p.get('repeat_header')) != repeated:
+                    raise ValueError('表格片段与单元格的重复表头标记不一致')
+            elif block['kind'] == 'composite':
+                collisions = _validate_composite(block,measured,preserve_overlap=preserve_overlap)
+                if collisions:
+                    retain_overlap(p, '组合块子块发生重叠', collisions)
+                image_counts[block['id']] += 1
+            elif block['kind'] == 'image':
+                image_counts[block['id']] += 1
+            elif block['kind'] != 'image':
+                raise ValueError('不支持的重建块类型')
+        except ValueError as exc:
+            if frames is None or not recoverable_geometry_error(exc):
+                raise
             frame = frames.get(p.get('frame_id'))
-            if frame is None or frame['page_index'] != p['page_index']:
-                raise ValueError('重建片段的所属区域不存在或跨越目标页')
-            if block['source'].get('page_id') != page['source_page_id']:
-                raise ValueError('保留源版面的内容块不得移到其他源页')
-            fx0, fy0, fx1, fy1 = frame['bbox']
-            if x0 < fx0-.02 or y0 < fy0-.02 or x1 > fx1+.02 or y1 > fy1+.02:
-                raise ValueError('重建片段越出所属区域边界')
-            if 'block_ids' in frame and p['block_id'] not in frame['block_ids']:
-                raise ValueError('重建片段不属于当前区域')
-        for previous in page_boxes.setdefault(p['page_index'], []):
-            previous_box = previous['bbox']
-            overlap = max(0., min(x1, previous_box[2]) - max(x0, previous_box[0])) * max(0., min(y1, previous_box[3]) - max(y0, previous_box[1]))
-            if overlap > .05:
-                if not (frames is not None and _preserved_owned_overlap(p, previous, by_id)):
-                    raise ValueError('自适应重建的内容块发生重叠')
-                if root is not None and not _owned_alpha_overlap(p, previous, by_id, root):
-                    raise ValueError('重叠区域的图片透明像素与归属证据不一致')
-        page_boxes[p['page_index']].append(p)
-        if block['kind'] == 'text':
-            _validate_lines(measured)
-            content = block['content'].get('text', '')
-            r = p.get('content_range', {})
-            if not (0 <= r.get('start', -1) <= r.get('end', -1) <= len(content)):
-                raise ValueError('文字片段内容范围无效')
-            _validate_source_lines(measured.get('lines', []), content, r['start'], r['end'])
-            text_ranges.setdefault(block['id'], []).append((r['start'], r['end']))
-        elif block['kind'] == 'table':
-            cells = {c['id']: c for c in block['content']['cells']}
-            if len(cells) != len(block['content']['cells']):
-                raise ValueError('源表格单元格 ID 重复')
-            r = p.get('content_range', {})
-            first, last = r.get('row_start'), r.get('row_end')
-            if (not isinstance(first, int) or not isinstance(last, int) or
-                    not 0 <= first < last <= block['content']['row_count']):
-                raise ValueError('表格片段行范围无效')
-            repeated, seen_cells = False, set()
-            for cell in measured.get('cells', []):
-                if cell['id'] in seen_cells:
-                    raise ValueError('同一表格片段的单元格 ID 重复')
-                seen_cells.add(cell['id'])
-                if (min(cell['x'], cell['y']) < -.02 or cell['width'] <= 0 or cell['height'] <= 0 or
-                        cell['x'] + cell['width'] > measured['width'] + .05 or
-                        cell['y'] + cell['height'] > measured['height'] + .05):
-                    raise ValueError('单元格测量结果溢出表格片段')
-                _validate_lines(cell)
-                source = cells.get(cell['id'])
-                if source is None:
-                    raise ValueError('表格片段包含未知单元格')
-                if cell.get('text', '') != source.get('text', ''):
-                    raise ValueError('单元格测量快照与源内容不一致')
-                _validate_source_lines(cell.get('lines', []), source.get('text', ''))
-                if any(cell.get(k, 1) != source.get(k, 1) for k in ('row', 'column', 'rowspan', 'colspan')):
-                    raise ValueError('表格测量快照改变了单元格结构')
-                if cell.get('repeat_header', False):
-                    repeated = True
-                    if (not p.get('repeat_header') or not source.get('header') or not cell.get('header') or
-                            first == 0 or source['row'] + source.get('rowspan', 1) > first):
-                        raise ValueError('重复表头标记只能用于续表中的源表头')
-                else:
-                    if not first <= source['row'] < source['row'] + source.get('rowspan', 1) <= last:
-                        raise ValueError('普通单元格不属于当前表格片段行范围')
-                    table_cells.setdefault(block['id'], Counter())[cell['id']] += 1
-            if bool(p.get('repeat_header')) != repeated:
-                raise ValueError('表格片段与单元格的重复表头标记不一致')
-        elif block['kind'] == 'composite':
-            _validate_composite(block,measured)
-            image_counts[block['id']] += 1
-        elif block['kind'] == 'image':
-            image_counts[block['id']] += 1
-        elif block['kind'] != 'image':
-            raise ValueError('不支持的重建块类型')
+            if frame is None:
+                raise
+            source = next(s for s in project['source_pages'] if s['id'] == frame['source_page_id'])
+            failure = RegionLayoutError(str(exc), frame, source)
+            failure.placement = p
+            raise failure from exc
     # Every logical block must have at least one concrete placement.
     placed = {p['block_id'] for p in layout.get('placements', [])}
     if set(by_id) != placed:
@@ -372,13 +445,33 @@ def _line_text(page, lines, measured, origin, expected):
         font = library.export_font_for_key(key)
         size = float(line.get('font_size', measured['font_size']))
         writer = fitz.TextWriter(page.rect)
-        writer.append((origin[0] + line.get('x', 0), origin[1] + line['baseline']),
-                      text, font=font, fontsize=size)
+        for run in line.get('text_runs',[dict(text=text,x=0.)]):
+            writer.append((origin[0]+line.get('x',0)+run['x'],origin[1]+line['baseline']),
+                          run['text'],font=font,fontsize=size)
         writer.write_text(page, color=_color(line.get('color', measured.get('color'))), overlay=True)
         expected.update(c for c in text if not c.isspace())
 
 
-def _render_pdf(project, root, destination):
+def _background_placement(project, spec):
+    sources = project.get('source_pages', [])
+    source = next((p for p in sources if p['id'] == spec.get('source_page_id')), None)
+    if source is None and spec['index'] < len(sources):
+        source = sources[spec['index']]
+    if source is None or not source.get('background'):
+        return None
+    sw, sh = source['width_pt'], source['height_pt']
+    if spec.get('diagnostic_canvas'):
+        original=spec['diagnostic_canvas']['original_size']
+        dx,dy=spec['diagnostic_canvas']['offset']
+        scale=min(1.,original[0]/sw,original[1]/sh)
+        x,y=dx+(original[0]-sw*scale)/2,dy+(original[1]-sh*scale)/2
+        return source['background']['asset'],[x,y,x+sw*scale,y+sh*scale]
+    scale = min(1., spec['width']/sw, spec['height']/sh)
+    x, y = (spec['width']-sw*scale)/2, (spec['height']-sh*scale)/2
+    return source['background']['asset'], [x, y, x+sw*scale, y+sh*scale]
+
+
+def _render_pdf(project, root, destination, embedded_assets):
     by_id, pages, layout = _validate(project)
     placements = layout['placements']
     expected = []
@@ -386,6 +479,20 @@ def _render_pdf(project, root, destination):
         for spec in sorted(pages, key=lambda p: p['index']):
             page = pdf.new_page(width=spec['width'], height=spec['height'])
             inventory = Counter()
+            background = _background_placement(project, spec)
+            if background:
+                asset, box = background
+                # A PDF soft mask around the detection cutouts can produce grey
+                # outlines in viewers. The bottom layer sits on a white page;
+                # composite only its display copy, retaining the source asset.
+                from PIL import Image
+                with Image.open(_asset(root, asset)) as image:
+                    rgba = image.convert('RGBA')
+                    opaque = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+                    opaque.alpha_composite(rgba)
+                    stream = io.BytesIO()
+                    opaque.convert('RGB').save(stream, format='PNG')
+                page.insert_image(fitz.Rect(box), stream=stream.getvalue(), overlay=False)
             for placement in (p for p in placements if p['page_index'] == spec['index']):
                 block = by_id[placement['block_id']]
                 m = placement['measurement']
@@ -422,17 +529,12 @@ def _render_pdf(project, root, destination):
             expected.append(inventory)
         pdf.set_metadata({'title': '自适应结构化重建', 'creator': 'pdftransfer feature four',
                           'subject': 'V3 content, measured blocks, adaptive pagination; review required'})
-        # The project stays portable when only the PDF is downloaded: use the
-        # exact relative paths retained in its JSON as attachment names.
-        for name in sorted(_resource_names(project)):
+        # Default PDFs carry table evidence, not a second copy of every page,
+        # background and crop. Full project resources stay in the project tree;
+        # callers can explicitly request the complete attachment package.
+        for name in sorted(embedded_assets):
             asset = _asset(root, name)
             pdf.embfile_add(name, asset.read_bytes(), filename=name, desc='Project-relative reconstruction resource')
-        for block in project['blocks']:
-            if block['source'].get('label') == 'table' and block['source'].get('reference_asset'):
-                asset = _asset(root, block['source']['reference_asset'])
-                name = re.sub(r'[^\w.-]', '_', block['id']) + '-reference' + asset.suffix.lower()
-                if name not in pdf.embfile_names():
-                    pdf.embfile_add(name, asset.read_bytes(), filename=name, desc='Original table reference')
         return save_verified(pdf, destination, expected), expected
 
 
@@ -474,8 +576,13 @@ def _html_lines(lines, measured):
         style = (_css_style(dict(measured, **{k: line[k] for k in ('font_size','font_key','color') if k in line})) +
                  f'position:absolute;left:{line.get("x",0):.3f}pt;top:{top:.3f}pt;'
                  f'height:{height:.3f}pt;line-height:{height:.3f}pt;white-space:pre;')
-        result.append(f'<span class="measured-line" style="{html.escape(style,quote=True)}">'
-                      f'{html.escape(line.get("text",""))}</span>')
+        if 'text_runs' in line:
+            body=''.join(f'<span style="position:absolute;left:{run["x"]:.5f}pt">{html.escape(run["text"])}</span>'
+                         for run in line['text_runs'])
+            style += f'width:{line.get("advance_width",0):.5f}pt;'
+        else:
+            body=html.escape(line.get('text',''))
+        result.append(f'<span class="measured-line" style="{html.escape(style,quote=True)}">{body}</span>')
     return ''.join(result)
 
 
@@ -551,6 +658,13 @@ def _html_document(project):
     for page in sorted(pages, key=lambda p: p['index']):
         body.append(f'<section class="page" data-page="{page["index"]}" '
                     f'style="width:{page["width"]:.3f}pt;height:{page["height"]:.3f}pt">')
+        background = _background_placement(project, page)
+        if background:
+            from urllib.parse import quote
+            asset, (x0,y0,x1,y1) = background
+            body.append(f'<img class="page-background" alt="" aria-hidden="true" '
+                        f'src="../{quote(asset,safe="/")}" '
+                        f'style="left:{x0:.3f}pt;top:{y0:.3f}pt;width:{x1-x0:.3f}pt;height:{y1-y0:.3f}pt">')
         for p in (p for p in layout['placements'] if p['page_index'] == page['index']):
             block, m = by_id[p['block_id']], p['measurement']
             x0,y0,x1,y1 = p['bbox']
@@ -569,6 +683,7 @@ def _html_document(project):
                         f'data-fragment-id="{html.escape(p["fragment_id"],quote=True)}" style="{style}" contenteditable="true">{inner}</article>')
         body.append('</section>')
     css = ('body{background:#e8ecef;margin:20px}.page{position:relative;background:white;margin:18px auto;}'
+           '.page-background{position:absolute;pointer-events:none;user-select:none;z-index:0}.block{z-index:1}'
            '.block{position:absolute;margin:0;padding:0}.block img{display:block;width:100%;height:100%;object-fit:contain}'
            '.rebuild-table{border-collapse:collapse;table-layout:fixed;border-spacing:0;width:100%;}'
            '.rebuild-table td,.rebuild-table th{border:.5pt solid #000;vertical-align:top;box-sizing:border-box;}'
@@ -595,14 +710,30 @@ def _markdown_document(project):
         else:
             from urllib.parse import quote
             output.append(f'![{html.escape(label)}](<../{quote(block["content"]["asset"],safe="/")}>)')
+    from urllib.parse import quote
+    for index, page in enumerate(project.get('source_pages', []), 1):
+        if page.get('background'):
+            output.append(f'[第{index}页背景参考](<../{quote(page["background"]["asset"],safe="/")}>)')
     return '\n\n'.join(output) + '\n'
 
 
 def _resource_names(project):
     resources = set()
+    for issue in project.get('layout_result',{}).get('issues',[]):
+        if issue.get('diagnostic_asset'):
+            resources.add(issue['diagnostic_asset'])
+    for record in project.get('region_fallbacks', []):
+        for block in _walk_blocks(record.get('blocks', [])):
+            source = block.get('source', {})
+            if source.get('reference_asset'):
+                resources.add(source['reference_asset'])
+            if block['kind'] == 'image':
+                resources.add(block['content']['asset'])
     for page in project.get('source_pages', []):
         if page.get('reference_asset'):
             resources.add(page['reference_asset'])
+        if page.get('background'):
+            resources.add(page['background']['asset'])
     for block in _walk_blocks(project['blocks']):
         if block['kind'] == 'image':
             resources.add(block['content']['asset'])
@@ -613,8 +744,21 @@ def _resource_names(project):
     return resources
 
 
+def _pdf_resource_names(project, mode):
+    if mode == 'complete':
+        return _resource_names(project)
+    if mode != 'review':
+        raise ValueError('PDF resource mode must be review or complete')
+    blocks = list(_walk_blocks(project['blocks']))
+    for record in project.get('region_fallbacks', []):
+        blocks.extend(_walk_blocks(record.get('blocks', [])))
+    return {b['source']['reference_asset'] for b in blocks
+            if (b['kind'] == 'table' or b.get('source', {}).get('label') == 'table')
+            and b.get('source', {}).get('reference_asset')}
+
+
 @tracked('rebuild.adaptive_export', feature=lambda v: 'rebuild.' + v.get('format', 'pdf'))
-def export_project(project, output_dir, format='pdf'):
+def export_project(project, output_dir, format='pdf', *, pdf_resources='review'):
     """Return the requested result and export diagnostics for a measured IR."""
     if format not in {'pdf','html','md'}:
         raise ValueError('自适应重建仅支持 PDF、HTML 或 Markdown')
@@ -629,11 +773,23 @@ def export_project(project, output_dir, format='pdf'):
                        textBlockCount=sum(b['kind']=='text' for b in project['blocks']),
                        tableCount=sum(b['kind']=='table' for b in project['blocks']),
                        imageCount=sum(b['kind']=='image' for b in project['blocks']),
+                       backgroundPageCount=sum(bool(p.get('background')) for p in project.get('source_pages', [])),
                        compositeCount=sum(b['kind']=='composite' for b in project['blocks']),
+                       regionFallbackCount=len(project.get('region_fallbacks', [])),
+                       unresolvedLayouts=[i for i in project['layout_result'].get('issues',[])
+                                          if i.get('action')=='export-current-geometry-and-continue'],
                        orderChanges=project['layout_result'].get('order_changes', []),
                        limitations=['OCR and model boundaries require review.',
                                     'Role templates are selected styles, not recovered original typography.',
                                     'PDF text/glyph validation does not certify WPS editing or OCR accuracy.'])
+    if diagnostics['unresolvedLayouts']:
+        diagnostics['status']='layout-needs-review'
+    from .font_size_audit import font_size_audit
+    size_audit = font_size_audit(project)
+    diagnostics['fontSizeAudit'] = dict(asset='font-size-audit.json',
+        shrunkLineCount=size_audit['shrunk_line_count'],
+        shrunkLines=[r for r in size_audit['lines'] if r['shrunk']])
+    (root/'font-size-audit.json').write_text(_json(size_audit), encoding='utf-8')
     diagnostics['editableCharacterCount'] = sum(
         len(_nonspace(b['content'].get('text', ''))) if b['kind']=='text' else
         sum(len(_nonspace(c.get('text', ''))) for c in b['content'].get('cells', [])) if b['kind']=='table' else 0
@@ -642,8 +798,13 @@ def export_project(project, output_dir, format='pdf'):
         len(_nonspace(c.get('text', ''))) for p in project['layout_result']['placements']
         for c in p['measurement'].get('cells', []) if c.get('repeat_header'))
     if format == 'pdf':
+        embedded_assets = _pdf_resource_names(project, pdf_resources)
+        diagnostics['pdfResources'] = dict(
+            mode=pdf_resources, embeddedAssets=sorted(embedded_assets),
+            externalAssets=sorted(resources.keys() - embedded_assets),
+            completeProjectEmbedded=not bool(resources.keys() - embedded_assets))
         destination = root/'rebuilt-text.pdf'
-        diagnostics['pdfSafety'], expected = _render_pdf(project, root, destination)
+        diagnostics['pdfSafety'], expected = _render_pdf(project, root, destination, embedded_assets)
         # This expected result is checked against both the packaged bytes and
         # the reopened file before this export can return successfully.
         diagnostics['pdfSafety']['finalPackaging'] = dict(diagnostics['pdfSafety']['reopened'])
@@ -664,6 +825,7 @@ def export_project(project, output_dir, format='pdf'):
         (tree/'summary'/f'summary.{format}').write_text(
             _html_document(project) if format=='html' else _markdown_document(project), encoding='utf-8')
         (tree/'conversion-report.json').write_bytes(diagnostics_json.encode('utf-8'))
+        (tree/'font-size-audit.json').write_text(_json(size_audit), encoding='utf-8')
         destination = root/f'rebuilt-{format}.zip'
         with zipfile.ZipFile(destination,'w',zipfile.ZIP_DEFLATED) as archive:
             for asset in sorted(tree.rglob('*')):

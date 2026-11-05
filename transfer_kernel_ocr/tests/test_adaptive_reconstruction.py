@@ -10,7 +10,6 @@ import pymupdf as fitz
 import pytest
 
 from backend.adaptive_reconstruction import blocks_from_page, derive_relations, convert_adaptive
-from test_app import local_app
 
 
 def evidence():
@@ -207,39 +206,40 @@ def test_overlap_uses_owned_pixels_and_keeps_full_reference(tmp_path):
         assert reference.getpixel((0,0))[3]==255
 
 
-def test_uncovered_foreground_retained_without_ocr_or_duplicate_pixels(tmp_path):
+def test_uncovered_foreground_is_page_background_not_layout_block(tmp_path):
     rgb,raw,page=evidence()
     rgb=rgb.copy()
     rgb[650:690,50:180]=[230,20,20]
     blocks=blocks_from_page(raw,rgb,page,tmp_path)
-    unknown=[b for b in blocks if b['source']['label']=='unknown']
-    assert len(unknown)==1
-    assert unknown[0]['kind']=='image'
-    assert unknown[0]['quality']['state']=='image_fallback'
-    assert 'unclassified-foreground-preserved-as-image' in unknown[0]['quality']['issues']
-    assert unknown[0]['source']['bbox_px'][1]>=640
-    assert unknown[0]['source']['ocr_lines']==[]
+    assert not any(b['source']['label']=='unknown' for b in blocks)
+    assert len(blocks)==4
+    background=page['background']
+    assert background['participates_in_layout'] is False
+    assert background['bbox_pt']==[0.,0.,300.,400.]
+    with Image.open(tmp_path/background['asset']) as image:
+        assert image.getpixel((70,670))==(230,20,20,255)
+        assert image.getpixel((50,30))[3]==0  # detected title is not painted again
+        assert image.getpixel((80,450))[3]==0  # detected image is not painted again
+    relations=derive_relations(dict(blocks=blocks,source_pages=[page]))
+    assert all('unclassified' not in i for i in relations['source_order'])
 
 
-def test_table_border_slivers_stay_in_reference_but_nearby_text_is_retained(tmp_path):
+def test_outside_text_edges_and_table_slivers_stay_in_background(tmp_path):
     rgb,raw,page=evidence()
     rgb=rgb.copy()
-    rgb[220:350,555:558]=0  # measured table edge extends 5px beyond layout box
-    rgb[355:358,40:520]=0  # disconnected edge fragments, not an L-shaped graphic
-    rgb[290:305,580:600]=0  # a nearby text fragment must remain
+    rgb[220:350,555:558]=0
+    rgb[355:358,40:520]=0
+    rgb[290:305,580:600]=0
     blocks=blocks_from_page(raw,rgb,page,tmp_path)
-    assert len(page['coverage_diagnostics'])==2
-    assert all(d['block_id']=='layout-2' for d in page['coverage_diagnostics'])
-    unknown=[b for b in blocks if b['source']['label']=='unknown']
-    assert unknown
-    assert any(b['source']['bbox_px'][2]>=600 for b in unknown)
+    assert len(blocks)==4
+    assert not any(b['source']['label']=='unknown' for b in blocks)
+    with Image.open(tmp_path/page['background']['asset']) as image:
+        assert image.getpixel((556,250))==(0,0,0,255)
+        assert image.getpixel((100,356))==(0,0,0,255)
+        assert image.getpixel((590,300))==(0,0,0,255)
+        assert image.getpixel((500,250))[3]==0
     table=next(b for b in blocks if b['kind']=='table')
     assert table['content']['column_widths']==[127.5,127.5]
-    rgb,raw,page=evidence()
-    rgb=rgb.copy()
-    rgb[250:266,555:558]=0  # short letter by the table edge is not decoration
-    blocks=blocks_from_page(raw,rgb,page,tmp_path/'short')
-    assert any(b['source']['label']=='unknown' for b in blocks)
 
 
 def test_occluded_table_does_not_publish_successful_topology(tmp_path):
@@ -289,21 +289,6 @@ def test_feature_four_real_export_uses_new_project_contract(tmp_path,monkeypatch
             assert 'project.json' in archive.namelist()
 
 
-def test_fourth_http_route_dispatches_new_v3_operation(local_app,monkeypatch):
-    client,_,_=local_app
-    rgb,raw,_=evidence()
-    monkeypatch.setenv('PDFTRANSFER_RECOGNITION','v3')
-    monkeypatch.setattr('backend.adaptive_reconstruction.recognize_page',lambda pixels:copy.deepcopy(raw))
-    def forbidden(*args,**kwargs):
-        raise AssertionError('Fixed scene parser must not implement new feature four')
-    monkeypatch.setattr('backend.structure_parser.recognize_page',forbidden)
-    image=io.BytesIO()
-    Image.fromarray(rgb).save(image,format='PNG')
-    response=client.post('/api/convert/rebuild',files=[('files',('input.png',image.getvalue(),'image/png'))],
-                         data={'ocr':'true','format':'html'})
-    assert response.status_code==200,response.text
-    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        assert json.loads(archive.read('project.json'))['schema']=='feature4-rebuild/1'
 
 
 def test_image_pixel_limit_fails_before_recognition(tmp_path,monkeypatch):
@@ -322,8 +307,9 @@ def test_large_pdf_raster_is_capped_while_source_points_remain(tmp_path,monkeypa
         pdf.new_page(width=200,height=200)
         pdf.save(source)
     calls=[]
-    def recognize(rgb):
+    def recognize(rgb, *, pixel_to_point):
         h,w=rgb.shape[:2]
+        assert pixel_to_point==[200/w,200/h]
         calls.append((w,h))
         return dict(width=w,height=h,layout_det_res=dict(boxes=[]))
     monkeypatch.setattr('backend.adaptive_reconstruction.MAX_PIXELS',10000)
@@ -332,4 +318,5 @@ def test_large_pdf_raster_is_capped_while_source_points_remain(tmp_path,monkeypa
     assert calls and calls[0][0]*calls[0][1]<=10000
     p=json.loads((tmp_path/'out/rebuild-project.json').read_text(encoding='utf-8'))
     assert p['source_pages'][0]['width_pt']==200
-    assert p['blocks'][0]['source']['bbox_pt']==[0,0,200,200]
+    assert p['blocks']==[]  # No fabricated whole-page obstacle in the new policy.
+    assert p['source_pages'][0]['recognition_incomplete']=='no-layout-detections'

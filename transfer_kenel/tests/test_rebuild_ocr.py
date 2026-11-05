@@ -136,7 +136,10 @@ class PageOCRTests(unittest.TestCase):
         self.assertEqual(len(records),1)
         self.assertEqual(records[0]['label'],'paragraph_title')
         self.assertEqual(records[0]['box'],[91.,41.,207.,66.])
-        self.assertEqual(info['line_assignments'][0]['assignment_method'],'bounded-layout-edge-tolerance')
+        # The source coverage now meets the 80% complete-owner threshold
+        # directly, without needing the old 98% edge-tolerance exception.
+        self.assertGreaterEqual(info['line_assignments'][0]['owner_coverage'],.8)
+        self.assertNotIn('assignment_method',info['line_assignments'][0])
         self.assertEqual(self.ocr.crop_calls[0][1].min(axis=(0,1)).tolist(),[13.,11.])
         self.assertEqual(self.diagnostics,[])
 
@@ -144,6 +147,41 @@ class PageOCRTests(unittest.TestCase):
         records,_,info=self.run_ocr([polygon(0,0,100,30)],[block('a','text',[0,0,100,16])])
         self.assertEqual(records,[])
         self.assertEqual(info['line_assignments'][0]['state'],'partial-owner-conflict')
+
+    def test_small_number_reverse_owner_keeps_full_det_beyond_twelve_pixel_pad(self):
+        records,local,info=self.run_ocr([polygon(10,10,110,30)],
+            [block('number','number',[50,12,60,28])])
+        self.assertEqual(len(records),1)
+        self.assertEqual(records[0]['text'],'width-100')
+        assignment=info['line_assignments'][0]
+        self.assertEqual(assignment['assignment_method'],'low-forward-reverse-coverage')
+        self.assertAlmostEqual(assignment['reverse_owner_coverage'],1.)
+        self.assertAlmostEqual(assignment['owner_coverage'],.08)
+        self.assertEqual(self.diagnostics,[])
+        self.assertEqual(local['number']['rec_boxes'][0].tolist(),[10.,10.,110.,30.])
+
+    def test_low_forward_reverse_still_rejects_weak_or_competing_candidates(self):
+        records,_,info=self.run_ocr([polygon(10,10,110,30)],
+            [block('a','number',[50,12,60,28]),block('b','number',[80,12,90,28])])
+        self.assertEqual(records,[])
+        self.assertEqual(info['unmatchedLineCount'],1)
+        self.assertEqual(len(info['line_assignments'][0]['reverse_candidates']),2)
+        records,_,_=self.run_ocr([polygon(10,10,110,30)],
+            [block('a','text',[100,20,180,80])])
+        self.assertEqual(records,[])
+
+    def test_cached_rec_is_reassigned_and_missing_number_is_recognized(self):
+        polys=[polygon(10,10,110,30),polygon(10,60,110,80)]
+        ocr=OCR([])
+        records,local,info=recognize_blocks(np.zeros((200,400,3),dtype=np.uint8),
+            SimpleNamespace(general_ocr_pipeline=ocr),
+            [block('tiny','number',[50,12,60,28]),block('body','text',[0,50,140,100])],{},[],
+            cached_ocr=dict(dt_polys=polys,records=[dict(text='cached body',score=.99,polygon=polys[1])]))
+        self.assertEqual(ocr.det_calls,[])
+        self.assertEqual([r['text'] for r in records],['width-100','cached body'])
+        self.assertEqual([r['block_id'] for r in records],['tiny','body'])
+        self.assertEqual(sum(len(images) for images,_,_ in ocr.text_rec_model.calls),1)
+        self.assertEqual(info['reusedRecognitionLineCount'],1)
 
     def test_ownership_exclusions_cannot_be_reclaimed_by_enclosing_text(self):
         records,_,_=self.run_ocr([polygon(20,10,40,20)],

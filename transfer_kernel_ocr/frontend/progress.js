@@ -36,7 +36,7 @@ class OperationProgress {
   }
   async request(url,options={}){
     const run=this.run;
-    const tracked=run&&options.method==='POST'&&(/^\/api\/convert\//.test(url)||url==='/api/documents'||url==='/api/detection-preview'||url==='/api/demo'||/\/export\//.test(url));
+    const tracked=run&&options.method==='POST'&&/^\/api\/convert\//.test(url);
     if(!tracked)return fetch(url,options);
     const headers=new Headers(options.headers);
     try{

@@ -47,7 +47,7 @@ test('tracked POST registers a progress token and preserves form data and header
 
 test('progress service failure leaves the actual conversion available',async()=>{
   const {controller,node}=setup(async url=>url==='/api/progress'?new Response('unavailable',{status:503}):new Response('converted'));
-  controller.start();const response=await controller.request('/api/documents',{method:'POST'});
+  controller.start();const response=await controller.request('/api/convert/reading',{method:'POST'});
   assert.equal(await response.text(),'converted');
   assert.match(node('#busy-progress-detail').textContent,/任务继续处理/);controller.stop();
 });

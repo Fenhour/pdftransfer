@@ -13,9 +13,10 @@ import math
 import statistics
 
 from .font_library import get_library
+from .stage_timing import timed_step
 
 
-ENGINE_VERSION = 'feature4-adaptive-4-internal-structure'
+ENGINE_VERSION = 'feature4-adaptive-5-four-layer'
 _EPS = 1e-5
 _TITLES = {'doc_title', 'paragraph_title', 'section_title', 'title', 'reference'}
 
@@ -216,7 +217,8 @@ def _table_measurement(block, width):
                 min_width=sum(minimums))
 
 
-def measure_block(block, width, *, preserve_envelope=True, use_source_layout=True):
+@timed_step('05','block_measurement')
+def measure_block(block, width, *, preserve_envelope=True, use_source_layout=True, whitespace_right_pt=0., text_bounds_pt=None):
     """Stage one: internally lay out a block at an explicit width in points.
 
     The JSON snapshot is tied to content, style, engine and available width.
@@ -227,7 +229,13 @@ def measure_block(block, width, *, preserve_envelope=True, use_source_layout=Tru
     kind, content = block['kind'], block['content']
     if kind == 'text':
         from .source_text import measure_source_text
-        value = measure_source_text(content, width, block.get('style', {}),
+        if use_source_layout and content.get('text_policy') == 'four-layer-v2':
+            from .four_layer_text import measure_four_layer
+            value = measure_four_layer(content,width,block.get('style',{}),block.get('source',{}),
+                                       preserve_envelope=preserve_envelope,whitespace_right_pt=whitespace_right_pt,
+                                       text_bounds_pt=text_bounds_pt)
+        else:
+            value = measure_source_text(content, width, block.get('style', {}),
                                     block.get('source', {}), _text_measurement,
                                     preserve_envelope=preserve_envelope) if use_source_layout else None
         if value is None:
@@ -278,7 +286,8 @@ def measure_block(block, width, *, preserve_envelope=True, use_source_layout=Tru
     payload = dict(engine=ENGINE_VERSION, kind=kind, width=width,
                    content=content, style=block.get('style', {}),
                    source_geometry=block.get('source', {}).get('bbox_pt'),
-                   preserve_envelope=preserve_envelope, use_source_layout=use_source_layout)
+                   preserve_envelope=preserve_envelope, use_source_layout=use_source_layout,
+                   whitespace_right_pt=whitespace_right_pt,text_bounds_pt=text_bounds_pt)
     value['signature'] = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
                                                   allow_nan=False).encode()).hexdigest()
     value['engine'] = ENGINE_VERSION

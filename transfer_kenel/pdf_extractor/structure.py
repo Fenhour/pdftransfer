@@ -66,7 +66,7 @@ def recognize_page(rgb):
 
 
 @tracked('v3.recognize_rebuild')
-def recognize_rebuild(rgb):
+def recognize_rebuild(rgb, *, pixel_to_point=(.5, .5)):
     """Feature-four typed crops; never changes the shared reading/editor path."""
     from PIL import Image
     if transport() != 'native':
@@ -81,7 +81,8 @@ def recognize_rebuild(rgb):
                  feature=headers.get('X-Pdftransfer-Feature'))
     with span('v3.native_roundtrip'):
         body = client.request(dict(op='recognize_rebuild',
-                    pngBase64=base64.b64encode(buffer.getvalue()).decode('ascii'),trace=trace))
+                    pngBase64=base64.b64encode(buffer.getvalue()).decode('ascii'),trace=trace,
+                    pixelToPoint=list(pixel_to_point)))
     result = _validated(body.get('result'),body,image.size)
     if not result.get('rebuild_policy') or not isinstance(result.get('region_det_res'),dict):
         raise ValueError('本机 V3 未返回功能四要求的类别与大区域证据')

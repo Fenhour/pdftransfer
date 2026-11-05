@@ -1,4 +1,4 @@
-"""Physical page selection shared by HTTP imports and the compatibility CLI."""
+"""Physical page selection for document conversions."""
 import re
 
 

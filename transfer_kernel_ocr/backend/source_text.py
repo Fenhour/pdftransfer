@@ -55,13 +55,16 @@ def _cluster(records):
     return sorted(rows, key=lambda r: (r['anchor'], r['bbox_px'][0]))
 
 
-def build_text_content(lines, block_id):
+def build_text_content(lines, block_id, *, four_layer=False, deduplicate=True):
     """Return canonical text plus independently positioned physical fragments.
 
     Every record appears once. Newlines encode physical fragment boundaries;
     semantic paragraphs are a secondary, conservative view for reading output.
     Invalid geometry retains the words but disables the positioned path.
     """
+    overlap_checks = []
+    # Duplicate removal requires measured target boxes and is performed once
+    # at page level. Building text content must never delete from source boxes.
     records, invalid = [], []
     for index, record in enumerate(lines):
         text = str(record.get('text', ''))
@@ -80,10 +83,12 @@ def build_text_content(lines, block_id):
     cursor = 0
     typical = median([b[3]-b[1] for _, _, b in records]) if records else 1.
     paragraph, previous = [], None
+    paragraph_index = 0
     for row_index, row in enumerate(rows):
         if previous is not None and row['bbox_px'][1]-previous[3] > typical*.9:
             semantic.append(' '.join(paragraph))
             paragraph = []
+            paragraph_index += 1
         row_text, indices = [], []
         for _, record, b in sorted(row['records'], key=lambda v: (v[2][0], v[0])):
             value = str(record['text'])
@@ -92,7 +97,11 @@ def build_text_content(lines, block_id):
             indices.append(len(fragments))
             fragments.append(dict(text=value, start=cursor, end=cursor+len(chunk),
                                   bbox_px=list(b), row=row_index,
-                                  line_id=record.get('line_id')))
+                                  line_id=record.get('line_id'),
+                                  **{key:record[key] for key in ('rebuilt_start_offset_pt','effective_source_range',
+                                      'effective_geometry_updated','rebuilt_bbox_pt',
+                                      'measurement_style','style_evidence') if key in record},
+                                  paragraph_id=f'{block_id}-paragraph-{paragraph_index}'))
             chunks.append(chunk)
             cursor += len(chunk)
             row_text.append(value)
@@ -105,7 +114,7 @@ def build_text_content(lines, block_id):
     if fragments:
         text = text[:-1]
         fragments[-1]['end'] -= 1
-    return dict(text=text,
+    return dict(text=text, **(dict(text_policy='four-layer-v2',source_overlap_checks=overlap_checks) if four_layer else {}),
                 paragraphs=[dict(id=f'{block_id}-paragraph-{i}', text=t) for i, t in enumerate(semantic)],
                 source_layout=dict(version=VERSION, coordinate_space='page-pixels',
                                    fragments=fragments, rows=serialized_rows))

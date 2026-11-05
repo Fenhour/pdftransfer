@@ -1,12 +1,36 @@
 {
-  "release": "v2.2026.10.28-internal-structure",
-  "date": "2026-10-28",
+  "release": "v3.2026.11.05-public-converters",
+  "date": "2026-11-05",
   "components": {
     "det": "det-fp32-zero-subnormals-v1",
     "rec": "rec-fp32-zero-subnormals-v1",
     "relations": "07-spatial-v2",
-    "layout": "08-regional-v4-internal-structure",
+    "layout": "08-four-layer-v5-bounded",
     "layoutPolicy": "source-preserving-regions-v1",
-    "internalLayout": "source-lines-and-cell-anchors-v1"
-  }
+    "internalLayout": "four-layer-text-v10-unreachable-edge-anchor",
+    "postAlignmentLocks": "latest-row-offsets-without-ideal-edge-equalities",
+    "duplicateMatching": "max-b-prefix-in-a-tail-right-to-left",
+    "textDetUnclipRatio": 1.5,
+    "pdfResources": "table-references-default-complete-opt-in-v1",
+    "rebuildPolicy": "feature4-text-v12-containment-1pt-20261105",
+    "minimumCompleteOwnerCoverage": 0.8,
+    "textLinkage": "text-linkage-axis-anchored-v2",
+    "blockLinkage": "november-1-existing-method",
+    "sourceContainment": "source-detection-containment-v2-1pt",
+    "sourceContainmentTolerancePt": 1.0,
+    "unresolvedLayout": "export-current-geometry-and-continue-v1",
+    "overlapRecovery": "preserve-composite-and-block-overlap-at-export-v1",
+    "threadScheduling": "six-thread-existing-runtime-new-scheduler-not-implemented",
+    "optionalEmptyBands": "O1-default-off",
+    "duplicateOverlapArea": "original-ocr-boxes-in-page-points",
+    "captionAlignment": "preserve-figure-caption-row-anchors",
+    "fontSizeAudit": "initial-style-vs-final-measurement-v1",
+    "tableImageBinding": "source-cell-or-contiguous-range-normalized-anchor-v1",
+    "unreachableAlignment": "preserve-actual-start-without-expandable-slots"
+  },
+  "features": [
+    "native-pdf-to-html",
+    "native-pdf-to-markdown",
+    "image-pdf-to-editable-pdf"
+  ]
 }

@@ -11,6 +11,7 @@ import binascii
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -55,8 +56,7 @@ def load_config(path=None):
     model_dir = os.environ.get('PDFTRANSFER_V3_MODEL_DIR') or supplied.get('model_dir') or (
         project_models if project_models.is_dir() else
         legacy_models if legacy_models.is_dir() else
-        (Path(os.environ['PDFTRANSFER_PADDLE_ROOT']) / 'cache/.paddlex/official_models'
-         if os.environ.get('PDFTRANSFER_PADDLE_ROOT') else Path.home() / '.paddlex/official_models'))
+        project_models)
     config['model_dir'] = str(_path(model_dir, selected.parent))
     config['results_dir'] = str(_path(os.environ.get('PDFTRANSFER_V3_RESULTS') or
                               config.get('results_dir', ROOT / 'tmp/v3-native-results'), selected.parent))
@@ -117,7 +117,7 @@ class NativeRuntime:
                     raise
         return self.pipeline
 
-    def recognize(self, data, trace=None, *, rebuild=False):
+    def recognize(self, data, trace=None, *, rebuild=False, pixel_to_point=(.5,.5)):
         if not isinstance(data, bytes) or not 0 < len(data) <= MAX_BYTES:
             raise ValueError('PNG input must be between 1 byte and 48 MiB')
         if not data.startswith(b'\x89PNG\r\n\x1a\n'):
@@ -127,7 +127,7 @@ class NativeRuntime:
                                                 **self.runtime_metadata) as usage:
             started = time.perf_counter()
             try:
-                answer = self._recognize(data, rebuild=rebuild)
+                answer = self._recognize(data, rebuild=rebuild, pixel_to_point=pixel_to_point)
                 answer['seconds'] = round(time.perf_counter() - started, 6)
                 answer['modelProfile'] = profiles
                 answer.update(self.runtime_metadata)
@@ -138,9 +138,11 @@ class NativeRuntime:
                 self.counters['failures'] += 1
                 raise
 
-    def _recognize(self, data, *, rebuild=False):
+    def _recognize(self, data, *, rebuild=False, pixel_to_point=(.5,.5)):
         from rebuild_pipeline import POLICY
         policy = POLICY.encode() if rebuild else b''
+        if rebuild and tuple(pixel_to_point) != (.5,.5):
+            policy += json.dumps(list(pixel_to_point)).encode()
         key = hashlib.sha256(BUILD.encode() + self.cache_signature + policy + data).hexdigest()
         target = Path(self.config['results_dir']) / (key + '.json')
         if target.is_file():
@@ -163,8 +165,18 @@ class NativeRuntime:
         model = self._pipeline()
         if rebuild:
             from rebuild_pipeline import recognize_rebuild
+            region_options = ({'region_unclip_ratio':self.config['rebuild_region_unclip_ratio']}
+                              if 'rebuild_region_unclip_ratio' in self.config else {})
+            region_options['pixel_to_point']=pixel_to_point
+            from evidence_cache import read_evidence
+            roots=[self.config['results_dir']]
+            if os.environ.get('PDFTRANSFER_V3_REUSE_RESULTS'):
+                roots.append(os.environ['PDFTRANSFER_V3_REUSE_RESULTS'])
+            evidence=read_evidence(data,self.config,BUILD,roots,width=width,height=height)
+            if evidence is not None:
+                region_options['cached_evidence']=evidence
             with span('v3.rebuild.predict', backend='native'):
-                result = recognize_rebuild(rgb, model)
+                result = recognize_rebuild(rgb, model, **region_options)
             self._publish(target, result)
             return dict(result=result, cacheHit=False, engine=BUILD)
         options = dict(use_table_orientation_classify=True,
@@ -236,7 +248,11 @@ def handle_request(runtime, request):
     if trace is not None and not isinstance(trace, dict):
         raise ValueError('Invalid trace metadata')
     if operation == 'recognize_rebuild':
-        return dict(id=request.get('id'), ok=True, **runtime.recognize(data, trace, rebuild=True))
+        scale=request.get('pixelToPoint',[.5,.5])
+        if (not isinstance(scale,(list,tuple)) or len(scale)!=2 or
+                any(type(v) not in (int,float) or not math.isfinite(v) or v<=0 for v in scale)):
+            raise ValueError('Invalid pixel-to-point scale')
+        return dict(id=request.get('id'), ok=True, **runtime.recognize(data, trace, rebuild=True,pixel_to_point=scale))
     return dict(id=request.get('id'), ok=True, **runtime.recognize(data, trace))
 
 

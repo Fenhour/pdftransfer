@@ -1,25 +1,58 @@
 # pdftransfer
 
-本地 PDF 阅读提取、OCR 页面编辑与结构化重建。当前版本见 VERSION.json。
+基于 PP-StructureV3 的 PDF 转换器，支持扫描件与文本层 PDF 的版面分析、文字识别、表格结构化提取与 Markdown/PDF 重建，并针对多栏、标题层级、文本对齐与重叠框去重做了后处理优化。
 
-- 阅读提取器：`transfer_kenel/pdf_extractor/`，输出 HTML / Markdown。
-- 网页编辑器：`transfer_kernel_ocr/backend/` 与 `frontend/`。
-- 共享本机 V3 推理：`services/structure_v3/`；检测预览还依赖 `services/tmp/detection_preview.py`。
+| 功能 | 输出 |
+| --- | --- |
+| 可编辑 PDF → HTML | HTML、图片资源与源 PDF 的 ZIP 包 |
+| 可编辑 PDF → Markdown | Markdown、图片资源与源 PDF 的 ZIP 包 |
+| 图片 / 扫描 PDF → 可编辑 PDF | 可搜索、可选择和可编辑的文字，保留版面与原图参考 |
 
-## 安装与运行
+## 安装
 
-建议 Python 3.12。Windows 建议将仓库及模型放在纯 ASCII 路径，避免 Paddle 读取中文路径失败。
+支持 Windows 10 / 11，使用 Python 3.12（64位）和 Git。首次安装需要联网下载依赖与官方模型；转换在本机 CPU 运行，无需 Docker、云服务或 API 密钥。
 
-1. 阅读功能运行 `transfer_kenel/setup.bat`。
-2. 网页功能运行 `transfer_kernel_ocr/setup.bat`。
-3. 扫描识别环境从仓库根执行 `powershell -ExecutionPolicy Bypass -File services/structure_v3/setup-native.ps1`。
-4. 按 [模型准备](docs/MODELS.md) 配置本地模型。
-5. 网页执行 `transfer_kernel_ocr/start.bat`，阅读界面执行 `transfer_kenel/start.bat`。
+如果尚未安装 Python 和 Git，在 PowerShell 执行下面两行，完成后关闭并重新打开 PowerShell：
 
-安装依赖需要网络；默认模型推理在本机 CPU 运行，不依赖云服务或大语言模型。模型权重、输入样例、输出、日志、环境及私人历史不随 Git 提供。
+```powershell
+winget install --id Python.Python.3.12 -e --accept-package-agreements --accept-source-agreements
+winget install --id Git.Git -e --accept-package-agreements --accept-source-agreements
+```
 
-## 协作
+复制下面整段到 PowerShell。安装目录使用纯英文路径，避免 Windows 下模型读取中文路径失败；已有同名目录时请换一个空目录。
 
-先阅读 [项目概况](docs/PROJECT_OVERVIEW.md)、[重建规则](docs/REBUILD_RULES.md)、[未来方向](docs/FUTURE_DIRECTION_2026-10-29.md) 和 [验证说明](docs/VALIDATION.md)。
+```powershell
+git clone --branch codex/core-collaboration-20261029 https://github.com/Fenhour/pdftransfer.git C:\pdftransfer
+Set-Location C:\pdftransfer
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
+```
 
-复杂表格、字体、公式和 OCR 仍需人工验收；保图回退不代表结构恢复。输入输出默认由应用在本地创建。提交前检查暂存区，勿提交真实文档、识别结果、日志、个人路径或密钥。
+安装脚本会创建应用与 OCR 两个独立环境，下载版面、文字与表格模型，并生成独立的 CPU 优化权重。重复执行会复用已完成的环境和模型；原始权重保留。
+
+## 启动与使用
+
+安装后每次启动只需：
+
+```powershell
+Set-Location C:\pdftransfer
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+浏览器会自动打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。选择转换方式、上传文件并下载结果。每次最多30个文件、总计256 MB，可指定物理页码；扫描转换最多1000页/帧，并提供后台队列与逐页预览。支持 PDF、PNG、JPEG、多页 TIFF、WebP 和 BMP。
+
+HTML / Markdown 转换读取 PDF 原生文字，不额外执行扫描 OCR。图片或扫描 PDF 请选择第三项。扫描重建结果中的文字、复杂表格、公式和字体仍需校对；无法可靠恢复的区域保留原图。遇到未解决的重叠布局会保留当前文字和位置、标记待复核，并继续其它页。
+
+在服务终端按 `Ctrl+C` 停止；停止前请等待队列完成。若8765端口已被占用，可复制：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -Port 8766
+```
+
+输入保存在 `transfer_kernel_ocr/input/`，转换结果保存在 `transfer_kernel_ocr/output/`。这些文件、模型、环境和日志不纳入 Git。部署失败时修正终端中的报错后重新执行安装命令；模型完整性可单独检查：
+
+```powershell
+.\services\structure_v3\.venv\Scripts\python.exe -X utf8 services/structure_v3/prepare_models.py --check
+```
+
+[转换流程](docs/ARCHITECTURE.md) · [开发与验证](docs/DEVELOPMENT.md)

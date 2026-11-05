@@ -61,6 +61,34 @@ def table_block():
                 local_layout={},quality=dict(state='needs_review',issues=[]))
 
 
+def test_page_background_exports_below_editable_text_and_is_packaged(tmp_path,font_data):
+    from PIL import Image, ImageDraw
+    text='Editable foreground'
+    p=project([text_block('body',text)],[placement('body',text_measure(text,font_data))])
+    background=Image.new('RGBA',(300,300),(0,0,0,0))
+    ImageDraw.Draw(background).rectangle((240,240,260,260),fill=(255,0,0,255))
+    (tmp_path/'assets').mkdir()
+    background.save(tmp_path/'assets/background.png')
+    p['source_pages'][0]['background']=dict(asset='assets/background.png',pixel_size=[300,300],
+        bbox_pt=[0.,0.,300.,300.],coordinate_space='source-page-points',participates_in_layout=False)
+    destination,_=export_project(p,tmp_path)
+    with fitz.open(destination) as pdf:
+        assert text in pdf[0].get_text()
+        pix=pdf[0].get_pixmap()
+        assert pix.pixel(250,250)==(255,0,0)
+        assert pix.pixel(280,280)==(255,255,255)
+        assert pdf[0].get_bboxlog()[0][0]=='fill-image'
+        # Background cutouts must not introduce PDF soft-mask outlines.
+        assert pdf[0].get_images(full=True)[0][1] == 0
+        assert 'assets/background.png' not in pdf.embfile_names()
+    destination,_=export_project(p,tmp_path,'html')
+    with zipfile.ZipFile(destination) as archive:
+        assert 'assets/background.png' in archive.namelist()
+        markup=archive.read('summary/summary.html').decode('utf8')
+        assert markup.index('class="page-background"') < markup.index('data-block-id="body"')
+        assert 'pointer-events:none' in markup
+
+
 def table_measure(font_data):
     key,font=font_data
     result=dict(width=200.,height=60.,column_widths=[100.,100.],row_heights=[30.,30.],cells=[])
@@ -100,7 +128,7 @@ def test_pdf_merged_table_uses_real_text_and_keeps_original_reference(tmp_path,f
     with fitz.open(destination) as pdf:
         text=pdf[0].get_text()
         assert all(text.count(t)==1 for t in ['Header','Left','Right'])
-        assert 'table-reference.png' in pdf.embfile_names()
+        assert pdf.embfile_get('assets/table.png') == (tmp_path/'assets/table.png').read_bytes()
         assert pdf[0].get_drawings()
         assert not pdf[0].get_images(), 'Original table is attached, never painted behind true text'
 
@@ -318,7 +346,8 @@ def test_the_same_header_cannot_be_repeated_twice_inside_one_fragment(tmp_path,f
         export_project(project([table],placements,pages=2),tmp_path)
 
 
-def test_pdf_project_resource_paths_resolve_from_attachments(tmp_path,font_data):
+@pytest.mark.parametrize('mode', ['review', 'complete'])
+def test_pdf_resource_modes_preserve_table_evidence_and_external_paths(tmp_path,font_data,mode):
     (tmp_path/'assets').mkdir()
     references=['assets/source-1.png','assets/table.png','assets/image.png','assets/image-crop.png']
     for index,name in enumerate(references):
@@ -332,7 +361,7 @@ def test_pdf_project_resource_paths_resolve_from_attachments(tmp_path,font_data)
                      content_range={},measurement=dict(width=200.,height=100.,asset=references[2]))]
     p=project([table,image],placements)
     p['source_pages'][0]['reference_asset']=references[0]
-    destination,_=export_project(p,tmp_path)
+    destination,diagnostics=export_project(p,tmp_path,pdf_resources=mode)
     with fitz.open(destination) as pdf:
         saved=json.loads(pdf.embfile_get('rebuild-project.json'))
         paths={page['reference_asset'] for page in saved['source_pages']}
@@ -342,8 +371,37 @@ def test_pdf_project_resource_paths_resolve_from_attachments(tmp_path,font_data)
             if block['kind']=='image':
                 paths.add(block['content']['asset'])
         assert paths==set(references)
-        for name in paths:
+        embedded = paths if mode == 'complete' else {'assets/table.png'}
+        assert set(pdf.embfile_names()) == embedded | {'rebuild-project.json','conversion-report.json'}
+        for name in embedded:
             assert pdf.embfile_get(name)==(tmp_path/name).read_bytes()
+        policy = diagnostics['pdfResources']
+        assert set(policy['externalAssets']) == paths - embedded
+        assert policy['completeProjectEmbedded'] is (mode == 'complete')
+        assert saved['report']['export']['pdfResources'] == policy
+        assert all((tmp_path/name).is_file() for name in paths)
+
+
+def test_default_pdf_omits_large_source_attachment_without_changing_render(tmp_path,font_data):
+    import random
+    (tmp_path/'assets').mkdir()
+    source = tmp_path/'assets/source.png'
+    Image.frombytes('RGB', (512,512), random.Random(0).randbytes(512*512*3)).save(source)
+    text = 'Same visible geometry'
+    p = project([text_block('body',text)],[placement('body',text_measure(text,font_data))])
+    p['source_pages'][0]['reference_asset'] = 'assets/source.png'
+    destination,_ = export_project(p,tmp_path,pdf_resources='complete')
+    full = destination.read_bytes()
+    with fitz.open(stream=full,filetype='pdf') as pdf:
+        pixels = pdf[0].get_pixmap().samples
+        visible_text = pdf[0].get_text()
+    destination,_ = export_project(p,tmp_path)
+    assert destination.stat().st_size < len(full)/2
+    with fitz.open(destination) as pdf:
+        assert pdf[0].get_pixmap().samples == pixels
+        assert pdf[0].get_text() == visible_text
+        assert 'assets/source.png' not in pdf.embfile_names()
+    assert source.is_file()
 
 
 def scaled_composite_project(font_data):
@@ -404,6 +462,40 @@ def test_scaled_composite_rejects_a_child_with_an_independent_scale(font_data):
     measured = p['layout_result']['placements'][0]['measurement']
     measured['children'][0]['measurement']['uniform_scale'] = 1.
     with pytest.raises(ValueError, match='父子必须采用相同'):
+        _validate(p)
+
+
+@pytest.mark.parametrize('format', ['pdf', 'html', 'md'])
+def test_composite_overlap_keeps_snapshot_and_exports_diagnostic(tmp_path, font_data, format):
+    p = scaled_composite_project(font_data)
+    block = p['blocks'][0]
+    other = copy.deepcopy(block['content']['children'][0])
+    other['id'] = 'second-child'
+    block['content']['children'].append(other)
+    item = p['layout_result']['placements'][0]
+    other_measurement = copy.deepcopy(item['measurement']['children'][0])
+    other_measurement['block_id'] = other['id']
+    item['measurement']['children'].append(other_measurement)
+    with pytest.raises(ValueError, match='组合块子块发生重叠'):
+        _validate(p)
+    p['layout_options'] = dict(text_adaptation_version='20261104')
+    p['layout_result'].update(target_structure='source-preserving-regions', frames=[dict(
+        id='frame', page_index=0, source_page_id='p1', bbox=[0.,0.,250.,100.], block_ids=['container'])])
+    p['layout_result']['pages'][0]['source_page_id'] = 'p1'
+    item['frame_id'] = 'frame'
+    before = copy.deepcopy(item['measurement'])
+    destination, _ = export_project(p, tmp_path, format=format)
+    assert destination.is_file()
+    assert item['measurement'] == before
+    assert item['unresolved_geometry']
+    issues = p['layout_result']['issues']
+    assert len(issues)==1 and issues[0]['reason']=='组合块子块发生重叠'
+    assert (tmp_path/issues[0]['diagnostic_asset']).is_file()
+    _validate(p, root=tmp_path)
+    assert len(issues)==1
+    # Overlap recovery still validates every child's source text.
+    other_measurement['measurement']['lines'][0]['text'] = 'corrupted'
+    with pytest.raises(ValueError, match='源内容不一致'):
         _validate(p)
 
 

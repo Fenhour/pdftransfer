@@ -156,7 +156,7 @@ def _plain_panel(rgb,rect,polygons):
                     total_pixels=int(crop.shape[0]*crop.shape[1])))
 
 
-def organize_source(blocks,rgb,page,raw,directory,save_image,text_content):
+def organize_source(blocks,rgb,page,raw,directory,save_image,text_content,*,preserve_image_blocks=False):
     """Build plain containers, retaining child IDs and a single visible owner."""
     sx,sy=page['pixel_to_point'] if 'pixel_to_point' in page else (page['width_pt']/page['width_px'],page['height_pt']/page['height_px'])
     assignments=(raw.get('ocr_pipeline') or {}).get('line_assignments',[])
@@ -171,6 +171,8 @@ def organize_source(blocks,rgb,page,raw,directory,save_image,text_content):
         # text panel or erase a neighboring/partly overlapping content block.
         if any(b['kind']=='table' and overlap(b['source']['bbox_px'],rect)>.05*min(area(rect),area(b['source']['bbox_px'])) for b in blocks):continue
         children=[b for b in blocks if b['id'] not in absorbed and _inside(b['source']['bbox_px'],rect,.9)]
+        if preserve_image_blocks and any(b['kind']=='image' for b in children):
+            continue  # 05I remains a complete raster block, including its text.
         if not children or any(b['kind'] not in {'text','image'} for b in children):continue
         if any(b['kind']=='image' and not _inside(b['source']['bbox_px'],rect,.995) for b in children):continue
         if any(b['id'] not in absorbed and b not in children and overlap(b['source']['bbox_px'],rect)>.05*area(b['source']['bbox_px']) for b in blocks):continue

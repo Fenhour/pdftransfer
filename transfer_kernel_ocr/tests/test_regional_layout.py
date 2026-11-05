@@ -36,6 +36,30 @@ def test_original_anchors_indentation_and_whitespace_remain_when_content_fits():
     _validate(p)
 
 
+def test_unmoved_heading_keeps_source_anchor_when_other_content_is_scaled():
+    from backend.regional_layout import _restore_clear_text_anchors
+    blocks=[text('title',[60,10,100,20]),text('body',[20,50,120,100])]
+    measured={'title':dict(width=40,height=10),'body':dict(width=100,height=60)}
+    positions={'title':[54,9],'body':[18,45]}
+    pos,scales,restored=_restore_clear_text_anchors(blocks,measured,positions,.9,[0,0,200,150],['body'])
+    assert pos['title']==[60,10] and scales['title']==1
+    assert pos['body']==[18,45] and scales['body']==.9
+    assert restored==['title'] and positions['title']==[54,9]
+
+
+def test_anchor_restoration_never_creates_collision_or_breaks_required_attachment():
+    from backend.regional_layout import _restore_clear_text_anchors
+    blocks=[text('title',[60,10,100,20]),text('body',[20,50,120,100])]
+    measured={'title':dict(width=40,height=10),'body':dict(width=100,height=60)}
+    positions={'title':[54,1],'body':[50,15]}
+    pos,_,restored=_restore_clear_text_anchors(blocks,measured,positions,.9,[0,0,200,150],['body'])
+    assert not restored and pos==positions  # Original title would hit body.
+    positions['body']=[18,45]
+    pos,_,restored=_restore_clear_text_anchors(blocks,measured,positions,.9,[0,0,200,150],['body'],
+        [dict(anchor='title',dependent='body',keep='required')])
+    assert not restored and pos==positions
+
+
 def test_growth_uses_existing_whitespace_before_moving_a_neighbor():
     a=text('a',[20,20,120,35],value='Line\nLine');b=text('b',[20,80,120,105])
     p=project([a,b]);layout_document(p)

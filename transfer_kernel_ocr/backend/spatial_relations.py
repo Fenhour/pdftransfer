@@ -182,10 +182,13 @@ def _projection(a, b, axis):
 
 
 def _spatial_edges(items, frame):
+    from .source_containment import source_contains_pair
     candidates = []
     bounds = {b['id']: b['source']['bbox_pt'] for b in items}
     for i, first in enumerate(items):
         for second in items[i+1:]:
+            if source_contains_pair(first, second):
+                continue
             a, b = bounds[first['id']], bounds[second['id']]
             for axis in (0, 1):
                 transverse = 1-axis
@@ -199,6 +202,7 @@ def _spatial_edges(items, frame):
                     continue
                 lo, hi = max(left[transverse], right[transverse]), min(left[transverse+2], right[transverse+2])
                 blocked = any(c['id'] not in {before['id'], after['id']} and
+                    not source_contains_pair(c, before) and not source_contains_pair(c, after) and
                     bounds[c['id']][axis] < right[axis]-_EPS and bounds[c['id']][axis+2] > left[axis+2]+_EPS and
                     max(0., min(hi, bounds[c['id']][transverse+2])-max(lo, bounds[c['id']][transverse])) >= .8*(hi-lo)
                     for c in items)
@@ -277,6 +281,13 @@ def _attachments(ordered, edges):
 def derive_spatial_relations(project):
     blocks = project.get('blocks', [])
     contains = _tree(blocks)
+    geometric = [dict(parent=f'{page["id"]}-{parent}', child=f'{page["id"]}-{child}',
+                      evidence='original-detection-containment')
+                 for page in project.get('source_pages', [])
+                 for parent,node in page.get('source_containment',{}).get('nodes',{}).items()
+                 for child in node['contained_ids']]
+    existing={(v['parent'],v['child']) for v in contains}
+    contains.extend(edge for edge in geometric if (edge['parent'],edge['child']) not in existing)
     groups, issues, frames, frame_membership, region_membership, hints, ordered, spatial = [], [], [], {}, {}, {}, [], []
     pages = project.get('source_pages', [])
     if len({p['id'] for p in pages}) != len(pages):
@@ -289,6 +300,46 @@ def derive_spatial_relations(project):
     for page in pages:
         items = [b for b in blocks if b['source']['page_id'] == page['id']]
         fs, membership, regions, page_hints = _page_frames(page, items, issues)
+        ratio = float(project.get('layout_options',{}).get('region_expand_ratio',1.))
+        if not math.isfinite(ratio) or not 1. <= ratio <= 1.25:
+            raise ValueError('大区域扩展比例须在1.00到1.25之间')
+        # Keep observed frames immutable; give each isolated frame only its
+        # own safe share of nearby whitespace. Never merge neighbouring frames.
+        for f in fs:
+            if f.get('kind') != 'region' or ratio == 1.:
+                continue
+            original = list(f['bbox_pt'])
+            cx,cy=(original[0]+original[2])/2,(original[1]+original[3])/2
+            hw,hh=(original[2]-original[0])*ratio/2,(original[3]-original[1])*ratio/2
+            wanted=[max(0.,cx-hw),max(0.,cy-hh),min(float(page['width_pt']),cx+hw),min(float(page['height_pt']),cy+hh)]
+            def safe(b):
+                for other in fs:
+                    if other is f or other.get('kind')!='region':
+                        continue
+                    # Half of each source gap prevents two expanded regions
+                    # competing for the same whitespace.
+                    ob=other.get('detection_bbox_pt',other['bbox_pt'])
+                    reserved=[(v+w)/2 for v,w in zip(original,b)]
+                    if _intersection(b,ob)>_EPS or _intersection(reserved,ob)>_EPS:
+                        return False
+                return not any(item['id'] not in f['block_ids'] and
+                               _intersection(item['source']['bbox_pt'],b)>_EPS for item in items)
+            # Neighbours use their original geometry; reserve half the gap
+            # independently on each separated axis.
+            for other in fs:
+                if other is f or other.get('kind')!='region': continue
+                ob=other.get('detection_bbox_pt',other['bbox_pt'])
+                if original[2] <= ob[0]: wanted[2]=min(wanted[2],(original[2]+ob[0])/2)
+                if original[0] >= ob[2]: wanted[0]=max(wanted[0],(original[0]+ob[2])/2)
+                if original[3] <= ob[1]: wanted[3]=min(wanted[3],(original[3]+ob[1])/2)
+                if original[1] >= ob[3]: wanted[1]=max(wanted[1],(original[1]+ob[3])/2)
+            candidate=wanted
+            for _ in range(20):
+                if safe(candidate): break
+                candidate=[(a+b)/2 for a,b in zip(original,candidate)]
+            else: candidate=original
+            f.update(detection_bbox_pt=original,bbox_pt=candidate,
+                     expansion=dict(requested_ratio=ratio,method='bounded-target-frame-whitespace'))
         frames.extend(fs)
         frame_membership.update(membership)
         region_membership.update(regions)

@@ -50,7 +50,7 @@ class NativeClient:
         executable = python_executable()
         if not executable.is_file():
             return dict(available=False, transport='native', loaded=False,
-                        error='本机 V3 环境未安装，请运行 services/structure_v3/setup-native.ps1')
+                        error='本机 V3 环境未安装，请在项目根目录运行 setup.ps1')
         # Metadata probing does not import Paddle or load any model. Cache it so
         # frontend health polling cannot repeatedly launch Python processes.
         key = (str(executable), str(os.environ.get('PDFTRANSFER_V3_MODEL_DIR', '')),
@@ -68,7 +68,7 @@ class NativeClient:
                 available = result.returncode == 0 and all(packages.values())
                 cached = dict(available=available, transport='native', packages=packages)
                 if not available:
-                    cached['error'] = '本机 V3 依赖不完整，请运行 services/structure_v3/setup-native.ps1'
+                    cached['error'] = '本机 V3 依赖不完整，请在项目根目录运行 setup.ps1'
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 cached = dict(available=False, transport='native', error='本机 V3 Python 环境无法运行')
             self.check = (key, time.monotonic() + 30, cached)
@@ -91,7 +91,7 @@ class NativeClient:
             return
         executable = python_executable()
         if not executable.is_file():
-            raise ValueError('本机 V3 环境未安装，请运行 services/structure_v3/setup-native.ps1；无需 Docker')
+            raise ValueError('本机 V3 环境未安装，请在项目根目录运行 setup.ps1')
         environment = os.environ.copy()
         environment.update(PYTHONUTF8='1', PDFTRANSFER_LOG_ROLE='v3-native',
                            PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True')

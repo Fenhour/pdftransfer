@@ -6,6 +6,10 @@
   },
   "results_dir": "../../tmp/v3-native-results",
   "cache_version": "1",
+  "pipeline_options": {
+    "text_det_unclip_ratio": 1.5
+  },
+  "rebuild_region_unclip_ratio": 1.03,
   "cpu_threads": 6,
   "device": "cpu",
   "enable_mkldnn": true,

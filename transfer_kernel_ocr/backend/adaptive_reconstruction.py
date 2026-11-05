@@ -19,16 +19,17 @@ import pymupdf as fitz
 from .options import selected_pages
 from .progress import report as progress
 from .usage import tracked, span
+from .stage_timing import capture_timings, timed_step, timing_summary
 
-PLAN = 'feature4-v3-canvas-2026-10-28-internal-structure'
+PLAN = 'feature4-text-linkage-2026-11-04'
 MAX_PIXELS = 40_000_000
 RASTER_LABELS = {'image', 'chart', 'seal', 'formula', 'unknown'}
 HEADINGS = {'doc_title', 'paragraph_title', 'title', 'reference'}
 
 
-def recognize_page(rgb):
+def recognize_page(rgb, *, pixel_to_point=(.5, .5)):
     from .recognition import shared_structure
-    return shared_structure().recognize_rebuild(rgb)
+    return shared_structure().recognize_rebuild(rgb, pixel_to_point=pixel_to_point)
 
 
 def _area(b):
@@ -72,78 +73,25 @@ def _save_image(rgb, bbox, directory, name, *, exclusions=(), mask=None):
     return relative, list(image.size)
 
 
-def _unclassified_blocks(rgb, boxes, page, directory):
-    """Keep visible undetected content as review images, never invented OCR.
-
-    This is a conservative pixel coverage check, not another classifier.
-    Two pixels around detected crops absorb antialiasing at their edges.
-    Thin adjacent table borders stay in the source reference instead of
-    becoming standalone flow images. Unclassified text remains visible.
-    """
-    import cv2
+def _page_background(rgb, boxes, page, directory):
+    """Keep pixels outside detected content at page level, never as obstacles."""
     h, w = rgb.shape[:2]
-    covered = np.zeros((h, w), dtype=np.uint8)
+    covered = np.zeros((h, w), dtype=bool)
     for detection in boxes:
         b = detection['coordinate']
-        covered[max(0, math.floor(b[1])-2):min(h, math.ceil(b[3])+2),
-                max(0, math.floor(b[0])-2):min(w, math.ceil(b[2])+2)] = 1
-    foreground = (rgb.min(axis=2) < 245) & ~covered.astype(bool)
-    # Group nearby strokes into local review regions; ignore isolated specks.
-    merged = cv2.dilate(foreground.astype(np.uint8), np.ones((7, 15), np.uint8))
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
-    regions = []
-    for index in range(1, count):
-        x, y, width, height, _ = stats[index]
-        local = (labels[y:y+height, x:x+width] == index) & foreground[y:y+height, x:x+width]
-        if int(local.sum()) >= 8:
-            yy,xx = np.nonzero(local)
-            xx,yy = xx+x,yy+y
-            # Require a genuinely thin stroke, not just a narrow dilation box.
-            fw,fh = int(xx.max()-xx.min()+1),int(yy.max()-yy.min()+1)
-            if min(fw,fh) <= 12 and max(fw,fh) >= max(40,8*min(fw,fh)):
-                owner = None
-                for detection in boxes:
-                    if detection.get('label') != 'table':
-                        continue
-                    a,b,c,d = detection['coordinate']
-                    if (fh>fw and fh < (d-b)*.25) or (fw>=fh and fw < (c-a)*.25):
-                        continue
-                    near_vertical = ((np.abs(xx-a)<=12)|(np.abs(xx-c)<=12)) & (yy>=b-2) & (yy<=d+2)
-                    near_horizontal = ((np.abs(yy-b)<=12)|(np.abs(yy-d)<=12)) & (xx>=a-2) & (xx<=c+2)
-                    if np.all(near_vertical|near_horizontal):
-                        owner=detection['id']
-                        break
-                if owner is not None:
-                    page.setdefault('coverage_diagnostics',[]).append(dict(
-                        reason='table-edge-decoration-retained-in-reference',block_id=owner,
-                        bbox_px=[int(xx.min()),int(yy.min()),int(xx.max()+1),int(yy.max()+1)],
-                        pixel_count=int(local.sum())))
-                    continue
-            regions.append((int(index), [int(x), int(y), int(x+width), int(y+height)]))
-    # Bound pathological noisy scans without silently dropping the remainder.
-    groups = [[v] for v in regions[:63]]
-    if len(regions) > 63:
-        groups.append(regions[63:])
-    blocks = []
-    sx, sy = page['width_pt']/w, page['height_pt']/h
-    for index, group in enumerate(groups):
-        ids = [v[0] for v in group]
-        b = [min(v[1][0] for v in group), min(v[1][1] for v in group),
-             max(v[1][2] for v in group), max(v[1][3] for v in group)]
-        mask = np.isin(labels, ids) & ~covered.astype(bool)
-        identifier = f'{page["id"]}-unclassified-{index}'
-        reference, _ = _save_image(rgb, b, directory, identifier+'-reference')
-        asset, pixels = _save_image(rgb, b, directory, identifier, mask=mask)
-        blocks.append(dict(id=identifier, kind='image',
-            source=dict(page_id=page['id'], layout_detection_id=None, label='unknown',
-                bbox_px=b, bbox_pt=[b[0]*sx,b[1]*sy,b[2]*sx,b[3]*sy], reference_asset=reference,
-                score=None, ocr_lines=[], ownership={},
-                crop_to_page=[[1,0,b[0]],[0,1,b[1]],[0,0,1]],
-                coverage_evidence='uncovered-nonwhite-pixels; threshold=245; edge-tolerance=2px'),
-            content=dict(asset=asset,pixel_size=pixels,aspect_ratio=pixels[0]/pixels[1]),
-            style=_style('image',[],sy), local_layout={},
-            quality=dict(state='image_fallback',issues=['unclassified-foreground-preserved-as-image'])))
-    return blocks
+        covered[max(0, math.floor(b[1])):min(h, math.ceil(b[3])),
+                max(0, math.floor(b[0])):min(w, math.ceil(b[2]))] = True
+    mask = ~covered
+    foreground = mask & (rgb.min(axis=2) < 255)
+    page.pop('background', None)
+    if not foreground.any():
+        return
+    asset, pixels = _save_image(rgb, [0, 0, w, h], directory,
+                               page['id']+'-background', mask=mask)
+    page['background'] = dict(asset=asset, pixel_size=pixels,
+        bbox_pt=[0., 0., page['width_pt'], page['height_pt']],
+        coordinate_space='source-page-points', policy='outside-detection-background-v1',
+        foreground_pixel_count=int(foreground.sum()), participates_in_layout=False)
 
 
 def _records(raw, boxes):
@@ -154,6 +102,7 @@ def _records(raw, boxes):
     scores = ocr.get('rec_scores') or []
     line_ids = ocr.get('line_ids') or []
     labels = ocr.get('labels') or []
+    styles = ocr.get('line_styles') or []
     records = defaultdict(list)
     for i, (text, coords_i) in enumerate(zip(texts, coords)):
         b = _bbox(coords_i, raw['width'], raw['height'])
@@ -166,11 +115,18 @@ def _records(raw, boxes):
             best = max(candidates, default=(0, 0, None))
             owner = best[2] if best[0] >= .5 else None
         if owner:
-            records[owner].append(dict(text=str(text), bbox_px=b,
+            record = dict(text=str(text), bbox_px=b,
                                        score=float(scores[i]) if i < len(scores) else None,
                                        line_id=str(line_ids[i]) if i < len(line_ids) else f'ocr-{i}',
                                        label=labels[i] if i < len(labels) else None,
-                                       evidence_index=i))
+                                       evidence_index=i)
+            if i < len(styles) and isinstance(styles[i],dict):
+                evidence=styles[i]
+                if evidence.get('trusted') is True:
+                    record['measurement_style']={k:evidence[k] for k in
+                        ('font_size_pt','family','bold','italic') if k in evidence}
+                    record['style_evidence']=copy.deepcopy(evidence)
+            records[owner].append(record)
     return records
 
 
@@ -194,7 +150,8 @@ def _style(label, lines, sy):
                 observed_features=None, size_evidence='OCR-height-estimate-clamped-to-role-template')
 
 
-def blocks_from_page(raw, rgb, page, directory):
+@timed_step('05','typed_blocks')
+def blocks_from_page(raw, rgb, page, directory, *, four_layer=False):
     """Preserve identity and raw evidence while adapting all branches alike."""
     w, h = page['width_px'], page['height_px']
     if (raw.get('width'), raw.get('height')) != (w, h):
@@ -207,7 +164,52 @@ def blocks_from_page(raw, rgb, page, directory):
             boxes.append(dict(value, coordinate=b, id=str(value.get('id', f'layout-{i}'))))
     if len({b['id'] for b in boxes}) != len(boxes):
         raise ValueError('功能四版面检测 ID 重复，无法建立可靠对应关系')
+    from .source_containment import VERSION, build_containment, block_metadata, conflict_is_internal
+    existing = raw.get('source_containment', {})
+    containment = (copy.deepcopy(existing) if existing.get('version') == VERSION and
+                   existing.get('tolerance_px') == [1./sx, 1./sy] and
+                   existing.get('source_rects') == {b['id']:b['coordinate'] for b in boxes}
+                   else build_containment(boxes, pixel_to_point=(sx, sy)))
+    nodes = containment['nodes']
+    page['source_containment'] = containment
+    for detection in boxes:
+        detection['containment'] = copy.deepcopy(nodes[detection['id']])
     records = _records(raw, boxes)
+    original_records = copy.deepcopy(records)
+    if four_layer:
+        # 05I is a complete raster block. Explicitly prevent even stale or
+        # differently assigned OCR results inside it from becoming prose.
+        images = [v for v in boxes if str(v.get('label','')).lower() in RASTER_LABELS]
+        suppressed_lines = []
+        for owner, lines in list(records.items()):
+            kept = []
+            for line in lines:
+                image = next((v for v in images if v['id'] != owner and
+                              _overlap(line['bbox_px'],v['coordinate']) >= .95*_area(line['bbox_px'])),None)
+                if image:
+                    suppressed_lines.append(dict(line_id=line.get('line_id'),block_id=owner,
+                        image_id=image['id'],reason='05I-image-owned-text-not-reconstructed'))
+                else:
+                    kept.append(line)
+            records[owner] = kept
+        page['image_text_exclusions'] = suppressed_lines
+        from .four_layer_text import deduplicate_records, measure_record
+        indexed = [dict(line,_owner=owner) for owner,lines in records.items()
+                   if not any(v['id']==owner for v in images) for line in lines]
+        styles = {owner:_style(next(v['label'] for v in boxes if v['id']==owner),lines,sy)
+                  for owner,lines in records.items()}
+        # Alpha uses source intersection in pt, divided by the existing rebuilt
+        # character-area estimate. Prefix advances still use the measured font.
+        candidates = {i for i,a in enumerate(indexed) for j,b in enumerate(indexed)
+                      if i != j and _overlap(a['bbox_px'],b['bbox_px']) > 0}
+        indexed = [measure_record(line,styles[line['_owner']],sx,sy) if i in candidates else line
+                   for i,line in enumerate(indexed)]
+        cleaned,checks=deduplicate_records(indexed)
+        for owner in {line['_owner'] for line in indexed}:
+            records[owner]=[]
+        for line in cleaned:
+            owner=line.pop('_owner'); records[owner].append(line)
+        page['source_overlap_checks']=checks
     tables = {str(t.get('block_id')): t for t in raw.get('table_res_list') or []}
     suppressed = {str(d.get('block_id')) for d in raw.get('diagnostics', [])
                   if isinstance(d, dict) and d.get('reason') == 'fully-owned-by-another-block'}
@@ -215,10 +217,13 @@ def blocks_from_page(raw, rgb, page, directory):
                         'ocr-line-unmatched-block','ocr-line-recognition-rejected','empty-ocr-line-crop'}
     conflicts = {str(identifier) for d in raw.get('diagnostics', []) if isinstance(d, dict) and
                  d.get('reason') in conflict_reasons
-                 for identifier in [d.get('block_id'), *d.get('candidate_ids', [])] if identifier}
+                 for identifier in [d.get('block_id'), *d.get('candidate_ids', [])] if identifier
+                 and not conflict_is_internal(d, str(identifier), nodes)}
+    page['non_rendering_containers'] = []
+    empty_parents = []
     blocks = []
     # These pure parsers validate actual HTML topology and preserve empty cells.
-    from .structure_parser import _table_structure
+    from .table_structure import _table_structure
     for i, detection in enumerate(boxes):
         local_id, b = detection['id'], detection['coordinate']
         if local_id in suppressed:
@@ -229,13 +234,17 @@ def blocks_from_page(raw, rgb, page, directory):
         ownership = copy.deepcopy((raw.get('block_ownership') or {}).get(local_id, {}))
         exclusions = ownership.get('excluded_rects', [])
         lines = records.get(local_id, [])
+        if four_layer and lines and not any(r.get('text','').strip() for r in lines):
+            page.setdefault('suppressed_duplicate_text_blocks',[]).append(local_id)
+            continue
         block = dict(id=identifier, kind='text',
                      source=dict(page_id=page['id'], layout_detection_id=local_id, label=label,
                                  bbox_px=b, bbox_pt=[b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy],
+                                 containment=block_metadata(nodes[local_id], page['id']),
                                  score=detection.get('score'), reference_asset=crop,
                                  crop_to_page=[[1, 0, math.floor(b[0])], [0, 1, math.floor(b[1])], [0, 0, 1]],
                                  ownership=ownership,
-                                 ocr_lines=copy.deepcopy(lines)),
+                                 ocr_lines=copy.deepcopy(original_records.get(local_id,lines))),
                      content={}, style=_style(label, lines, sy), local_layout={},
                      quality=dict(state='needs_review', issues=[]))
         if local_id in conflicts and label not in RASTER_LABELS:
@@ -243,7 +252,10 @@ def blocks_from_page(raw, rgb, page, directory):
             block['quality'].update(state='image_fallback', issues=['ambiguous-ocr-line-ownership'])
         elif label == 'table':
             result = tables.get(local_id)
-            parsed = _table_structure(result, dict(id=identifier, bbox=b, text=''), sx, sy, w, h) if result and not exclusions else None
+            excluded_ids = ownership.get('excluded_block_ids', [])
+            internal_exclusions = bool(excluded_ids) and len(excluded_ids) == len(exclusions) and all(
+                i in nodes[local_id]['contained_ids'] for i in excluded_ids)
+            parsed = _table_structure(result, dict(id=identifier, bbox=b, text=''), sx, sy, w, h) if result and (not exclusions or internal_exclusions) else None
             if parsed:
                 if result.get('reconstruction_evidence'):
                     block['source']['table_reconstruction'] = dict(
@@ -264,6 +276,8 @@ def blocks_from_page(raw, rgb, page, directory):
                     column_ratios=[(z-a)/(b[2]*sx-b[0]*sx) for a, z in zip(parsed['columns'], parsed['columns'][1:])],
                     reference_asset=crop, pred_html=result.get('pred_html', '')))
                 block['quality']['issues'].append('model-table-topology-needs-review')
+                if internal_exclusions:
+                    block['quality']['issues'].append('contained-content-kept-as-separate-source-blocks')
                 from .source_table import enrich_table_content
                 enrich_table_content(block['content'], block['source'], parsed)
                 if parsed['geometryStatus'] == 'estimated-from-html-topology':
@@ -277,8 +291,20 @@ def blocks_from_page(raw, rgb, page, directory):
             if label != 'image':
                 block['quality']['issues'].append('unsupported-specialized-content-preserved-as-image')
         else:
-            block['content'] = dict(_text_content(lines, identifier), role=label)
+            from .source_text import build_text_content
+            block['content'] = dict(build_text_content(lines,identifier,four_layer=four_layer,deduplicate=False),role=label)
+            if four_layer:
+                block['content']['source_overlap_checks']=[c for c in page['source_overlap_checks']
+                    if c['a'] in {r.get('line_id') for r in lines} or c['b'] in {r.get('line_id') for r in lines}]
+            if four_layer and not lines and any(v['block_id']==local_id for v in page['image_text_exclusions']):
+                page.setdefault('suppressed_image_text_blocks',[]).append(local_id)
+                continue
             if not block['content']['text'].strip():
+                if nodes[local_id]['contained_ids']:
+                    # Decide after all children have been built. An empty
+                    # geometric container is not a failed text recognition.
+                    empty_parents.append(block)
+                    continue
                 exclusions = exclusions or [v['coordinate'] for v in boxes if v['id'] != local_id and
                               (str(v.get('label', '')).lower() in RASTER_LABELS | {'table'} or
                                _area(v['coordinate']) < _area(b))]
@@ -295,14 +321,36 @@ def blocks_from_page(raw, rgb, page, directory):
                 transcript=copy.deepcopy(lines), transcript_rendering='metadata-only',
                 transcript_coordinate_space='page-pixels')
         blocks.append(block)
+    visible = {b['id'] for b in blocks}
+    for block in sorted(empty_parents, key=lambda b: _area(b['source']['bbox_px'])):
+        children = [i for i in block['source']['containment']['contained_ids'] if i in visible]
+        if children:
+            page['non_rendering_containers'].append(dict(
+                id=block['id'], source=copy.deepcopy(block['source']),
+                visible_contained_ids=children, participates_in_layout=False,
+                reason='source-container-content-owned-by-children'))
+        else:
+            b = block['source']['bbox_px']
+            crop, pixels = _save_image(rgb, b, directory, block['id']+'-fallback')
+            block.update(kind='image', content=dict(asset=crop, pixel_size=pixels,
+                aspect_ratio=pixels[0]/pixels[1], transcript=[], transcript_rendering='metadata-only',
+                transcript_coordinate_space='page-pixels'))
+            block['quality'].update(state='image_fallback', issues=['no-reliable-ocr-text'])
+            blocks.append(block)
+            visible.add(block['id'])
     page['detections'] = dict(layout=boxes, regions=(raw.get('region_det_res') or {}).get('boxes') or [])
     if blocks:
         from .source_geometry import organize_source
-        blocks = organize_source(blocks,rgb,page,raw,directory,_save_image,_text_content)
+        def make_text(lines,identifier):
+            from .source_text import build_text_content
+            return build_text_content(lines,identifier,four_layer=four_layer)
+        blocks = organize_source(blocks,rgb,page,raw,directory,_save_image,make_text,
+                                 preserve_image_blocks=four_layer)
         coverage = boxes + [dict(coordinate=b['source']['bbox_px']) for b in blocks
                             if b['source'].get('label') == 'container']
-        blocks.extend(_unclassified_blocks(rgb, coverage, page, directory))
-    if not blocks:
+        coverage.extend(dict(coordinate=line['bbox_px']) for lines in original_records.values() for line in lines)
+        _page_background(rgb, coverage, page, directory)
+    if not blocks and not four_layer:
         crop, pixels = _save_image(rgb, [0, 0, w, h], directory, page['id']+'-unclassified')
         blocks.append(dict(id=page['id']+'-unclassified', kind='image',
             source=dict(page_id=page['id'], layout_detection_id=None, label='unknown', bbox_px=[0,0,w,h],
@@ -310,6 +358,9 @@ def blocks_from_page(raw, rgb, page, directory):
                         score=None, ocr_lines=[], ownership={}, crop_to_page=[[1,0,0],[0,1,0],[0,0,1]]),
             content=dict(asset=crop,pixel_size=pixels,aspect_ratio=w/h), style=_style('image',[],sy),
             local_layout={}, quality=dict(state='image_fallback',issues=['no-layout-detections'])))
+    if not blocks and four_layer:
+        _page_background(rgb,[],page,directory)
+        page['recognition_incomplete'] = 'no-layout-detections'
     page['detections'] = dict(layout=boxes, regions=(raw.get('region_det_res') or {}).get('boxes') or [])
     page['suppressed_detection_ids'] = sorted(suppressed)
     page['recognition'] = dict(service=raw.get('_service', {}), policy=raw.get('rebuild_policy'),
@@ -348,7 +399,8 @@ def _input_pages(paths, spec):
 
 
 @tracked('rebuild.adaptive_convert', feature=lambda v: 'rebuild.'+v.get('format','pdf'))
-def convert_adaptive(paths, output_dir, document_id, *, format='pdf', pages=''):
+@capture_timings
+def convert_adaptive(paths, output_dir, document_id, *, format='pdf', pages='', layout_options=None, on_page=None):
     if format not in {'pdf','html','md'}:
         raise ValueError('结构化重建仅支持 PDF、HTML 或 Markdown')
     paths, directory = [Path(p) for p in paths], Path(output_dir)
@@ -356,10 +408,16 @@ def convert_adaptive(paths, output_dir, document_id, *, format='pdf', pages=''):
     directory.mkdir(parents=True,exist_ok=True)
     project = dict(schema='feature4-rebuild/1', id=document_id, plan=PLAN,
                    source_pages=[], blocks=[], relations={}, layout_result={},
+                   layout_options={**dict(four_layer=True,empty_bands=False,region_expand_ratio=1.05,
+                                         text_adaptation_version='20261104'),
+                                   **(layout_options or {})},
                    limitations=['OCR and model topology require review.',
                                 'Style values are role templates, not recovered original typography.',
                                 'Source geometry is preserved where feasible; local growth stays within isolated frames.',
                                 'Region membership and reading-order evidence still require review.'])
+    from .adaptive_export import export_project, _html_document
+    from .region_recovery import layout_with_region_recovery
+    completed = []
     ordinal, started = 0, time.perf_counter()
     for file_index, (path, selection) in enumerate(zip(paths,selections)):
         for physical in selection:
@@ -386,32 +444,91 @@ def convert_adaptive(paths, output_dir, document_id, *, format='pdf', pages=''):
                           pixel_to_point=[width_pt/w,height_pt/h])
             source['reference_asset'] = _save_image(rgb,[0,0,w,h],directory,source['id'])[0]
             with span('rebuild.v3_branches'):
-                raw = recognize_page(rgb)
+                raw = (recognize_page(rgb) if source['pixel_to_point']==[.5,.5] else
+                       recognize_page(rgb,pixel_to_point=source['pixel_to_point']))
             with span('rebuild.typed_blocks'):
-                project['blocks'].extend(blocks_from_page(raw,rgb,source,directory))
+                project['blocks'].extend(blocks_from_page(raw,rgb,source,directory,
+                                                        four_layer=True))
             project['source_pages'].append(source)
-    with span('rebuild.relations'):
-        project['relations'] = derive_relations(project)
-    progress(72,'两层自适应排版','保留源位置，在区域内检查碰撞与等比适配')
-    from .adaptive_layout import layout_document
-    from .adaptive_export import export_project
-    with span('rebuild.adaptive_layout'):
-        project['layout_result'] = layout_document(project)
+            if on_page is not None:
+                # Layout each page exactly once. No cross-page reflow is permitted
+                # by the source-preserving Region policy.
+                local = {**project, 'source_pages':[source],
+                         'blocks':[b for b in project['blocks'] if b['source']['page_id']==source['id']],
+                         'relations':{}, 'layout_result':{}}
+                local.pop('region_fallbacks', None)
+                with span('rebuild.relations'):
+                    local['relations'] = derive_relations(local)
+                with span('rebuild.adaptive_layout'):
+                    local['layout_result'] = layout_with_region_recovery(local, directory)
+                preview = directory/'previews'/f'page-{ordinal}.html'
+                preview.parent.mkdir(exist_ok=True)
+                temporary = preview.with_suffix('.tmp')
+                temporary.write_text(_html_document(local), encoding='utf-8')
+                temporary.replace(preview)
+                for record in local.get('region_fallbacks',[]):
+                    record['selected_page_number'] = ordinal
+                completed.append(local)
+                on_page(dict(number=ordinal,total=total,file_index=file_index,
+                             layout_needs_review=any(i.get('action')=='export-current-geometry-and-continue'
+                                 for i in local['layout_result'].get('issues',[])),
+                             physical_page=physical+1,preview=preview.relative_to(directory).as_posix()))
+    if on_page is not None:
+        project['blocks'] = [b for page in completed for b in page['blocks']]
+        project['relations'] = _merge_page_records([p['relations'] for p in completed])
+        layouts = []
+        offset = 0
+        order_offset = 0
+        for page in completed:
+            layout = page['layout_result']
+            for record in layout['pages']:
+                record['index'] += offset
+            for record in layout['placements'] + layout.get('frames',[]):
+                record['page_index'] += offset
+            for change in layout.get('order_changes',[]):
+                change['source_index'] += order_offset
+                change['target_index'] += order_offset
+            order_offset += len(layout['resolved_order'])
+            offset += len(layout['pages'])
+            layouts.append(layout)
+        project['layout_result'] = _merge_page_records(layouts)
+        project['region_fallbacks'] = [r for p in completed for r in p.get('region_fallbacks',[])]
+    else:
+        with span('rebuild.relations'):
+            project['relations'] = derive_relations(project)
+        progress(72,'两层自适应排版','保留源位置，在区域内检查碰撞与等比适配')
+        with span('rebuild.adaptive_layout'):
+            project['layout_result'] = layout_with_region_recovery(project, directory)
+    if project.get('region_fallbacks'):
+        if on_page is not None:
+            (directory/'region-overflow.json').write_text(json.dumps(dict(schema='region-overflow/1',
+                document_id=document_id,output_dir=str(directory.resolve()),regions=project['region_fallbacks']),
+                ensure_ascii=False,indent=2),encoding='utf-8')
+        project['limitations'].append('Overflow regions retain original pixels; their content is not editable reconstruction. See region-overflow.json.')
     report = dict(schema='feature4-conversion/1',plan=PLAN,format=format,status='needs-review',
                   layoutElapsedSeconds=round(time.perf_counter()-started,6),
                   sourcePageCount=total,pageCount=len(project['layout_result']['pages']),
                   independentTextLines=sum(len(b['source'].get('ocr_lines',[])) for b in project['blocks'] if b['kind']=='text'),
                   tableCount=sum(b['kind']=='table' for b in project['blocks']),
                   imageCount=sum(b['kind']=='image' for b in project['blocks']),
+                  backgroundPageCount=sum(bool(p.get('background')) for p in project['source_pages']),
                   compositeCount=sum(b['kind']=='composite' for b in project['blocks']),
                   blockCount=len(project['blocks']),orderChanges=project['layout_result'].get('order_changes',[]),
                   recognitionBackend='v3',strategy='typed-blocks-two-level-adaptive',
                   relationsVersion=project['relations'].get('algorithm_version'),
                   layoutVersion=project['layout_result'].get('algorithm_version'),
                   regionAdjustments=project['layout_result'].get('region_adjustments',[]),
+                  layoutOptions=project['layout_options'],
+                  stageTimings=timing_summary(),
+                  paragraphAdjustments=paragraph_adjustments(project['layout_result']),
+                  regionFallbacks=project.get('region_fallbacks', []),
+                  unresolvedLayouts=[i for i in project['layout_result'].get('issues',[])
+                                     if i.get('action')=='export-current-geometry-and-continue'],
                   limitations=project['limitations'])
     if any(b['quality']['state']=='image_fallback' for b in project['blocks']):
         report['status']='partial'
+    if report['unresolvedLayouts']:
+        report['status']='layout-needs-review'
     project['report']=report
     progress(85,'导出重建文档','写入真实文字、表格与图像资源')
     with span('rebuild.adaptive_export'):
@@ -419,3 +536,37 @@ def convert_adaptive(paths, output_dir, document_id, *, format='pdf', pages=''):
     (directory/'conversion.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     progress(100,'转换完成')
     return destination,report
+
+
+def paragraph_adjustments(layout):
+    """Include descendants and later Region scaling in searchable evidence."""
+    records=[]
+    def walk(identifier,measurement,frame_id):
+        for state in measurement.get('paragraph_adjustments',[]):
+            row=copy.deepcopy(state)
+            factor=measurement.get('uniform_scale',1.)
+            row.update(block_id=identifier,frame_id=frame_id,region_scale=factor,
+                       paragraph_region_scaled=factor<1.-1e-8,
+                       paragraph_any_scaled=bool(row.get('paragraph_font_scaled')) or factor<1.-1e-8)
+            records.append(row)
+        for child in measurement.get('children',[]):
+            walk(child['block_id'],child['measurement'],frame_id)
+    for p in layout.get('placements',[]):
+        walk(p['block_id'],p['measurement'],p.get('frame_id'))
+    return records
+
+
+def _merge_page_records(records):
+    """Merge independent source-page evidence without changing IDs or geometry."""
+    result = {}
+    for record in records:
+        for key,value in record.items():
+            if isinstance(value,list):
+                result.setdefault(key,[]).extend(value)
+            elif isinstance(value,dict):
+                result.setdefault(key,{}).update(value)
+            elif key not in result:
+                result[key] = value
+            elif result[key] != value:
+                raise ValueError(f'不兼容的逐页排版元数据: {key}')
+    return result

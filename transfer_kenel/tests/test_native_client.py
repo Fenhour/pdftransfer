@@ -121,7 +121,7 @@ class NativeClientTests(unittest.TestCase):
     def test_missing_python_fails_before_process_launch(self):
         with patch.dict(os.environ, {'PDFTRANSFER_V3_PYTHON': str(self.root / 'absent.exe')}), \
                 patch.object(native_client.subprocess, 'Popen', side_effect=AssertionError('unexpected spawn')):
-            with self.assertRaisesRegex(ValueError, '环境未安装.*无需 Docker'):
+            with self.assertRaisesRegex(ValueError, r'环境未安装.*setup\.ps1'):
                 self.client.request(dict(op='recognize'))
 
     def test_default_native_recognition_uses_png_stdio_and_preserves_profile(self):

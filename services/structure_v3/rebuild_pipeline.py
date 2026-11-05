@@ -9,7 +9,7 @@ import math
 
 from pdftransfer_usage import span
 
-POLICY = 'feature4-image-transcript-composite-v5'
+POLICY = 'feature4-text-v12-containment-1pt-20261105'
 TEXT_LABELS = {'text', 'paragraph_title', 'doc_title', 'number', 'abstract',
                'content', 'figure_title', 'reference', 'reference_content',
                'footnote', 'header', 'footer', 'algorithm', 'formula_number',
@@ -159,21 +159,31 @@ def _ocr_records(raw, block_id, dx, dy, ownership, diagnostics):
     return records
 
 
-def recognize_rebuild(rgb, model):
+def recognize_rebuild(rgb, model, *, region_unclip_ratio=None, cached_evidence=None,
+                      pixel_to_point=(.5, .5)):
     import numpy as np
     pipeline = _unwrap(model, 'layout_det_model')
     bgr = np.asarray(rgb)[:, :, ::-1].copy()
     height,width = bgr.shape[:2]
     diagnostics = []
     with span('v3.rebuild.layout', backend='native'):
-        layout = _detections(_first(pipeline.layout_det_model(bgr)), width,height,'layout')
+        layout = (cached_evidence['layout_det_res']['boxes'] if cached_evidence is not None else
+                  _detections(_first(pipeline.layout_det_model(bgr)), width,height,'layout'))
         region_model = getattr(pipeline, 'region_detection_model', None)
         if region_model is None:
             raise ValueError('Feature four requires PP-DocBlockLayout region detection')
-        regions = _detections(_first(region_model(bgr,layout_nms=True,layout_merge_bboxes_mode='small')),
-                              width,height,'region')
+        region_options = dict(layout_nms=True,layout_merge_bboxes_mode='small')
+        if region_unclip_ratio is not None:
+            if not math.isfinite(float(region_unclip_ratio)) or not 1. <= float(region_unclip_ratio) <= 1.25:
+                raise ValueError('region_unclip_ratio must be between 1.0 and 1.25')
+            region_options['layout_unclip_ratio'] = float(region_unclip_ratio)
+        regions = (cached_evidence['region_det_res']['boxes'] if cached_evidence is not None else
+                   _detections(_first(region_model(bgr,**region_options)),width,height,'region'))
     if not layout:
         diagnostics.append(dict(reason='no-layout-detections'))
+    from source_containment import build_containment, conflict_is_internal
+    containment = build_containment(layout, pixel_to_point=pixel_to_point)
+    nodes = containment['nodes']
     ordered = sorted(layout,key=_rank)
     tables, block_ownership = [], {}
     for index,block in enumerate(ordered):
@@ -188,13 +198,20 @@ def recognize_rebuild(rgb, model):
             continue
     from rebuild_ocr import recognize_blocks
     with span('v3.rebuild.ocr', backend='native', policy=POLICY):
+        options = {}
+        if cached_evidence is not None:
+            overall=cached_evidence['overall_ocr_res']
+            options['cached_ocr']=dict(dt_polys=cached_evidence['ocr_pipeline']['dt_polys'],
+                records=[dict(text=t,score=s,polygon=p) for t,s,p in zip(
+                    overall['rec_texts'],overall['rec_scores'],overall['rec_polys'])])
         ocr_records, local_results, ocr_info = recognize_blocks(
-            bgr, pipeline, ordered, block_ownership, diagnostics)
+            bgr, pipeline, ordered, block_ownership, diagnostics, **options)
     conflict_reasons = {'ocr-line-crosses-layout-blocks', 'ocr-line-crosses-visual-block',
                         'ocr-line-unmatched-block', 'ocr-line-recognition-rejected',
                         'empty-ocr-line-crop'}
     conflicts = {identifier for item in diagnostics if item.get('reason') in conflict_reasons
-                 for identifier in [item.get('block_id'), *item.get('candidate_ids', [])] if identifier}
+                 for identifier in [item.get('block_id'), *item.get('candidate_ids', [])] if identifier
+                 and not conflict_is_internal(item, identifier, nodes)}
     for index,block in enumerate(ordered):
         if block['id'] not in local_results:
             continue
@@ -204,7 +221,8 @@ def recognize_rebuild(rgb, model):
         if not raw['rec_texts']:
             diagnostics.append(dict(block_id=block['id'],reason='empty-ocr-result'))
         if block['label'] == 'table':
-            if not raw['rec_texts']:
+            internal_overlaps = bool(overlaps) and all(i in nodes[block['id']]['contained_ids'] for i in overlaps)
+            if not raw['rec_texts'] and not internal_overlaps:
                 # A valid empty grid is not evidence that source cells were
                 # blank. Preserve the table rather than erase missed text.
                 diagnostics.append(dict(block_id=block['id'],reason='table-empty-ocr-image-fallback'))
@@ -212,7 +230,7 @@ def recognize_rebuild(rgb, model):
             if block['id'] in conflicts:
                 diagnostics.append(dict(block_id=block['id'],reason='table-ocr-conflict-image-fallback'))
                 continue
-            if overlaps:
+            if overlaps and not internal_overlaps:
                 # An occluded table is not a trustworthy complete structure.
                 # Preserve its owned pixels downstream instead of publishing
                 # a successful grid inferred from a partly whitened source.
@@ -220,6 +238,13 @@ def recognize_rebuild(rgb, model):
                                         excluded_ids=overlaps,
                                         excluded_pixel_count=evidence['total_pixel_count']-evidence['owned_pixel_count']))
                 continue
+            if internal_overlaps:
+                # Internal detections are legitimate content, not occlusion.
+                # Use intact pixels for topology; OCR ownership stays unique.
+                crop,dx,dy,_,_ = _mask_crop(bgr,block,[v for v in ordered[:index]
+                    if v['id'] not in nodes[block['id']]['contained_ids']])
+                diagnostics.append(dict(block_id=block['id'],reason='table-contained-blocks-accepted',
+                                        contained_ids=overlaps))
             table_pipeline = getattr(pipeline,'table_recognition_pipeline',None)
             if table_pipeline is None:
                 diagnostics.append(dict(block_id=block['id'],reason='table-recognition-disabled'))
@@ -234,14 +259,12 @@ def recognize_rebuild(rgb, model):
                               use_ocr_results_with_table_cells=True))
                 for value in result.get('table_res_list', []):
                     table = _plain(value)
-                    from rebuild_tables import validated_table
-                    table = validated_table(table, raw, crop)
-                    if table is None:
-                        diagnostics.append(dict(block_id=block['id'],reason='table-content-or-geometry-mismatch-image-fallback'))
-                        continue
-                    if table.get('reconstruction_evidence'):
-                        diagnostics.append(dict(block_id=block['id'],reason='table-geometry-reconciled',
-                            method=table['reconstruction_evidence']['method']))
+                    # Keep the native V3 topology. The additional OCR-content /
+                    # cell-overlap gate and row-band repair are paused pending
+                    # review; downstream structural parsing still applies.
+                    table['validation_policy'] = 'native-v3-specialized-validation-paused'
+                    diagnostics.append(dict(block_id=block['id'],
+                        reason='table-native-result-specialized-validation-paused'))
                     cells = []
                     for box in table.get('cell_box_list',[]):
                         array = np.asarray(box,dtype=float)
@@ -267,10 +290,12 @@ def recognize_rebuild(rgb, model):
                 diagnostics.append(dict(block_id=block['id'],reason='table-structure-unavailable',
                                         error_type=type(error).__name__))
     return dict(width=width,height=height,input_path=None,rebuild_policy=POLICY,
-                layout_det_res=dict(boxes=layout),region_det_res=dict(boxes=regions),
+                evidence_reuse=cached_evidence.get('reuse_provenance') if cached_evidence is not None else None,
+                layout_det_res=dict(boxes=layout),region_det_res=dict(boxes=regions,unclip_ratio=region_unclip_ratio),
                 overall_ocr_res=dict(rec_texts=[r['text'] for r in ocr_records],
                      rec_boxes=[r['box'] for r in ocr_records],rec_polys=[r['polygon'] for r in ocr_records],
                      rec_scores=[r['score'] for r in ocr_records],block_ids=[r['block_id'] for r in ocr_records],
                      line_ids=[r['line_id'] for r in ocr_records],labels=[r['label'] for r in ocr_records]),
                 table_res_list=tables,parsing_res_list=[],block_ownership=block_ownership,
+                source_containment=containment,
                 ocr_pipeline=ocr_info,diagnostics=diagnostics)

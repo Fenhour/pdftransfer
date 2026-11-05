@@ -5,11 +5,27 @@ from copy import deepcopy
 import hashlib
 import json
 import math
+from .stage_timing import timed_step
 
 
-LAYOUT_VERSION = '08-regional-v4-internal-structure'
+LAYOUT_VERSION = '08-four-layer-v5-bounded'
 POLICY = 'source-preserving-regions-v1'
 _EPS = .05
+
+
+class RegionLayoutError(ValueError):
+    """A bounded geometry failure with the source frame retained for recovery."""
+
+    def __init__(self, message, frame, page):
+        super().__init__(message)
+        self.frame = deepcopy(frame)
+        self.page = deepcopy(page)
+
+
+def recoverable_geometry_error(exc):
+    return any(token in str(exc) for token in (
+        '越出', '越界', '溢出', '超过可读下限', '区域内碰撞无法有界解决',
+        '重叠关系不明确', '需继续布局处理'))
 
 
 def _signature(value):
@@ -99,6 +115,7 @@ def owned_image_pair(first, second):
     return False
 
 
+@timed_step('08','apply_scale')
 def scale_measurement(measured, factor):
     """Scale physical lengths only; never change source ranges or topology."""
     factor = float(factor)
@@ -113,9 +130,13 @@ def scale_measurement(measured, factor):
         if key in result:
             result[key] = [v*factor for v in result[key]]
     for line in result.get('lines', []):
-        for key in ('x', 'baseline', 'height', 'font_size'):
+        for key in ('x', 'baseline', 'height', 'font_size','advance_width'):
             if key in line:
                 line[key] *= factor
+        for run in line.get('text_runs',[]):
+            run['x'] *= factor
+        for key in line.get('spacing_pt',{}):
+            line['spacing_pt'][key] *= factor
     for adjustment in result.get('internal_adjustments', []):
         for key in ('shift_pt', 'font_size'):
             if key in adjustment:
@@ -157,8 +178,10 @@ def _arrange(items, measurements, frame, spatial_edges=()):
     Reading order is deliberately not an input to this physical adjustment.
     """
     left, top, _, _ = frame
+    from .source_containment import source_contains_pair
     boxes = {b['id']: image_source_bbox(b) for b in items}
-    positions = {i: [b[0]-left, b[1]-top] for i, b in boxes.items()}
+    positions = {i: [b[0]-left+measurements[i].get('block_expansion',{}).get('left_pt',0.),
+                     b[1]-top+measurements[i].get('block_expansion',{}).get('top_pt',0.)] for i, b in boxes.items()}
     gaps = {}
     for edge in spatial_edges:
         a, b = edge.get('a'), edge.get('b')
@@ -177,6 +200,8 @@ def _arrange(items, measurements, frame, spatial_edges=()):
         changed = False
         for index, a in enumerate(identifiers):
             for b in identifiers[index+1:]:
+                if source_contains_pair(by_id[a], by_id[b]):
+                    continue
                 ta, tb = target(a), target(b)
                 if _overlap(ta, tb) <= _EPS:
                     continue
@@ -257,6 +282,44 @@ def measure_source_composite(block, width, measure):
                 local_adjustments=moved, internal_layout='source-relative')
 
 
+def _restore_clear_text_anchors(items, measurements, positions, factor, frame, moved, attachments=()):
+    """Keep unrelated text at its source anchor if the final scene permits it.
+
+    The existing block solver still resolves colliding blocks. An untouched
+    heading/caption need not inherit another block's Region scale/translation.
+    Each restoration is checked against the complete final sibling scene.
+    """
+    left,top,right,bottom=frame
+    from .source_containment import source_contains_pair
+    by_id={b['id']:b for b in items}
+    current={i:list(p) for i,p in positions.items()}
+    scales={b['id']:factor for b in items}
+    restored=[]
+    def rect(identifier):
+        x,y=current[identifier];m=measurements[identifier];s=scales[identifier]
+        return [x,y,x+m['width']*s,y+m['height']*s]
+    for b in items:
+        identifier=b['id']
+        if b['kind']!='text' or identifier in moved:
+            continue
+        if any(link.get('keep')=='required' and identifier in {link.get('anchor'),link.get('dependent')} and
+               ({link.get('anchor'),link.get('dependent')}-{identifier}) & set(moved) for link in attachments):
+            continue
+        source=image_source_bbox(b);m=measurements[identifier];expansion=m.get('block_expansion',{})
+        anchor=[source[0]-left+expansion.get('left_pt',0.),source[1]-top+expansion.get('top_pt',0.)]
+        candidate=[*anchor,anchor[0]+m['width'],anchor[1]+m['height']]
+        if (candidate[0]<-_EPS or candidate[1]<-_EPS or
+                candidate[2]>right-left+_EPS or candidate[3]>bottom-top+_EPS):
+            continue
+        if any(_overlap(candidate,rect(other))>_EPS for other in current if other!=identifier
+               and not source_contains_pair(b,by_id[other])):
+            continue
+        if (abs(current[identifier][0]-anchor[0])>1e-8 or abs(current[identifier][1]-anchor[1])>1e-8 or
+                abs(scales[identifier]-1.)>1e-8):
+            current[identifier]=anchor;scales[identifier]=1.;restored.append(identifier)
+    return current,scales,restored
+
+
 def layout_regions(project, page_size=None, margin=24):
     from .adaptive_layout import measure_block, _topological_order, ENGINE_VERSION
 
@@ -305,85 +368,216 @@ def layout_regions(project, page_size=None, margin=24):
             if any(i in assigned or i not in by_id or by_id[i]['source']['page_id']!=page['id'] for i in identifiers):
                 raise ValueError('区域归属重复或引用了错误的模块')
             assigned.update(identifiers)
-            box = _rect(frame['bbox_pt'])
-            if min(box[0],box[1]) < 0 or box[2]>sw+.05 or box[3]>sh+.05:
-                raise ValueError('隔离区域越出源页面')
-            members = [by_id[i] for i in identifiers]
-            measured = {b['id']:measure_block(b,image_source_bbox(b)[2]-image_source_bbox(b)[0]) for b in members}
-            fw, fh = box[2]-box[0], box[3]-box[1]
-            def fit(values):
-                pos, changed = _arrange(members, values, box, relations.get('spatial_edges', []))
-                bounds = [min(0., *(p[0] for p in pos.values())),
-                          min(0., *(p[1] for p in pos.values())),
-                          max(fw, *(pos[i][0]+values[i]['width'] for i in identifiers)),
-                          max(fh, *(pos[i][1]+values[i]['height'] for i in identifiers))]
-                scale = min(1., fw/(bounds[2]-bounds[0]), fh/(bounds[3]-bounds[1]))
-                sizes = [v for m in values.values() for v in _font_sizes(m)]
-                total = scale*page_factor
-                readable = (total >= minimum_scale-1e-8 and
-                            all(s*total >= min(minimum_font,s)-1e-8 for s in sizes))
-                return pos, changed, bounds, scale, readable
+            measured, positions = {}, {}
+            try:
+                box = _rect(frame['bbox_pt'])
+                if min(box[0],box[1]) < 0 or box[2]>sw+.05 or box[3]>sh+.05:
+                    raise ValueError('隔离区域越出源页面')
+                members = [by_id[i] for i in identifiers]
+                def measure_member(b, preserve=True):
+                    sb=image_source_bbox(b)
+                    extra=0.
+                    text_bounds=None
+                    if policy.get('four_layer') and b['kind']=='text':
+                        limit=box[2]; left_limit=box[0];top_limit=box[1];bottom_limit=box[3]
+                        for other in members:
+                            ob=image_source_bbox(other)
+                            if other is not b and ob[0]>=sb[2] and min(sb[3],ob[3])>max(sb[1],ob[1]):
+                                limit=min(limit,ob[0])
+                            if other is not b and ob[2]<=sb[0] and min(sb[3],ob[3])>max(sb[1],ob[1]):
+                                left_limit=max(left_limit,ob[2])
+                            if other is not b and min(sb[2],ob[2])>max(sb[0],ob[0]):
+                                if ob[3]<=sb[1]:top_limit=max(top_limit,ob[3])
+                                if ob[1]>=sb[3]:bottom_limit=min(bottom_limit,ob[1])
+                        extra=max(0.,limit-sb[2])
+                        text_bounds=[max(0.,left_limit)-sb[0],max(0.,top_limit)-sb[1],
+                                     min(sw,limit)-sb[0],min(sh,bottom_limit)-sb[1]]
+                    return measure_block(b,sb[2]-sb[0],preserve_envelope=preserve,whitespace_right_pt=extra,
+                                         text_bounds_pt=text_bounds)
+                measured = {b['id']:measure_member(b) for b in members}
+                for identifier,value in measured.items():
+                    detail=value.get('text_linkage',{})
+                    if detail.get('status') in {'infeasible','undetermined'}:
+                        # Internal layout problems remain editable and visible;
+                        # no whole-region image fallback or silent success.
+                        issues.append(dict(frame_id=frame['id'],block_id=identifier,source_page_id=page['id'],
+                            physical_page_number=page.get('physical_page_index',0)+1,
+                            reason='unresolved-text-linkage',action='export-current-geometry-and-continue',
+                            text_linkage=deepcopy(detail)))
+                fw, fh = box[2]-box[0], box[3]-box[1]
+                solver_diagnostics = {}
+                def fit(values):
+                    if policy.get('four_layer'):
+                        from .four_layer_regions import solve
+                        pos,changed,scale,detail=solve(members,values,box,
+                            empty_bands_enabled=bool(policy.get('empty_bands',False)),
+                            attachments=relations.get('attachments',[]),
+                            minimum_scale=minimum_scale,minimum_font=minimum_font,page_factor=page_factor,
+                            max_rounds=policy.get('max_layout_rounds',16),
+                            uniform_region=policy.get('text_adaptation_version') in {'20261103','20261104'})
+                        solver_diagnostics.clear(); solver_diagnostics.update(detail)
+                        return pos,changed,[0.,0.,fw,fh],scale,True
+                    pos, changed = _arrange(members, values, box, relations.get('spatial_edges', []))
+                    bounds = [min(0., *(p[0] for p in pos.values())),
+                              min(0., *(p[1] for p in pos.values())),
+                              max(fw, *(pos[i][0]+values[i]['width'] for i in identifiers)),
+                              max(fh, *(pos[i][1]+values[i]['height'] for i in identifiers))]
+                    scale = min(1., fw/(bounds[2]-bounds[0]), fh/(bounds[3]-bounds[1]))
+                    sizes = [v for m in values.values() for v in _font_sizes(m)]
+                    total = scale*page_factor
+                    readable = (total >= minimum_scale-1e-8 and
+                                all(s*total >= min(minimum_font,s)-1e-8 for s in sizes))
+                    return pos, changed, bounds, scale, readable
 
-            positions, moved, bounds, factor, readable = fit(measured)
-            first_factor, compacted = factor, []
-            # Only an actual local overflow followed by an unreadable uniform
-            # fit permits releasing unused text envelope. Internal row gaps,
-            # table rows, image pixels and panel borders remain intact.
-            if factor < 1.-1e-8 and not readable:
-                candidate = dict(measured)
-                candidate_blocks = {}
-                for b in members:
-                    if b['kind'] != 'text':
-                        continue
-                    copy = deepcopy(b)
-                    compact = measure_block(copy, measured[b['id']]['width'], preserve_envelope=False)
-                    if compact['height'] < measured[b['id']]['height']-_EPS:
-                        candidate[b['id']] = compact
-                        candidate_blocks[b['id']] = copy
-                if candidate_blocks:
-                    pos, changed, cbounds, scale, accepted = fit(candidate)
-                    if accepted and scale > factor+1e-8:
-                        positions, moved, bounds, factor, readable = pos, changed, cbounds, scale, True
-                        measured = candidate
-                        compacted = sorted(candidate_blocks)
-                        for b in members:
-                            if b['id'] in candidate_blocks:
-                                b['local_layout'] = candidate_blocks[b['id']]['local_layout']
-            x0,y0,x1,y1 = bounds
-            total_factor = factor*page_factor
-            if not readable:
-                raise ValueError(f'区域 {frame["id"]} 需要缩放至 {total_factor:.3f}，超过可读下限；需校对样式或区域，未挤入其他大区域')
-            target = [ox+box[0]*page_factor,oy+box[1]*page_factor,
-                      ox+box[2]*page_factor,oy+box[3]*page_factor]
-            frames.append(dict(id=frame['id'],source_page_id=page['id'],page_index=page_index,
-                               bbox=target,source_bbox_pt=box,block_ids=list(identifiers),kind=frame['kind']))
-            adjustment = dict(frame_id=frame['id'],uniform_scale=total_factor,region_scale=factor,
-                              page_scale=page_factor,moved_block_ids=moved,
-                              source_bbox_pt=box,target_bbox=target,local_content_bounds=[x0,y0,x1,y1])
-            if compacted:
-                adjustment.update(envelope_compaction=dict(
-                    reason='region-overflow-uniform-fit-below-readable-floor',
-                    first_region_scale=first_factor, block_ids=compacted,
-                    scope='unused-trailing-text-envelope-only'))
-            adjustments.append(adjustment)
-            if factor < 1.-1e-8 or moved:
-                issues.append(dict(frame_id=frame['id'],reason='region-local-adaptation',uniform_scale=total_factor))
-            for identifier in identifiers:
-                m = scale_measurement(measured[identifier], total_factor)
-                x = target[0]+(positions[identifier][0]-x0)*total_factor
-                y = target[1]+(positions[identifier][1]-y0)*total_factor
-                kind = by_id[identifier]['kind']
-                content_range = (dict(start=0,end=len(by_id[identifier]['content'].get('text','')))
-                                 if kind=='text' else dict(row_start=0,row_end=by_id[identifier]['content']['row_count'])
-                                 if kind=='table' else dict(whole=True))
-                placements.append(dict(fragment_id=identifier+'-fragment-1',block_id=identifier,page_index=page_index,
-                                       bbox=[x,y,x+m['width'],y+m['height']],measurement=m,
-                                       content_range=content_range,repeat_header=False,frame_id=frame['id'],
-                                       source_transform=[total_factor,0.,0.,total_factor,
-                                                         target[0]-(box[0]+x0)*total_factor,
-                                                         target[1]-(box[1]+y0)*total_factor]))
+                compacted = []
+                try:
+                    positions, moved, bounds, factor, readable = fit(measured)
+                except ValueError as first_error:
+                    if not policy.get('four_layer') or not recoverable_geometry_error(first_error):
+                        raise
+                    # Only trailing free text envelope is expendable. No row
+                    # gap, raster pixels, table geometry or panel is trimmed.
+                    candidate=dict(measured)
+                    for b in members:
+                        if b['kind']=='text':
+                            compact=measure_member(b,False)
+                            if compact['height']<measured[b['id']]['height']-_EPS:
+                                candidate[b['id']]=compact; compacted.append(b['id'])
+                    if not compacted:
+                        raise
+                    positions,moved,bounds,factor,readable=fit(candidate)
+                    measured=candidate
+                first_factor = factor
+                # Only an actual local overflow followed by an unreadable uniform
+                # fit permits releasing unused text envelope. Internal row gaps,
+                # table rows, image pixels and panel borders remain intact.
+                if factor < 1.-1e-8 and not readable:
+                    candidate = dict(measured)
+                    candidate_blocks = {}
+                    for b in members:
+                        if b['kind'] != 'text':
+                            continue
+                        copy = deepcopy(b)
+                        compact = measure_block(copy, measured[b['id']]['width'], preserve_envelope=False)
+                        if compact['height'] < measured[b['id']]['height']-_EPS:
+                            candidate[b['id']] = compact
+                            candidate_blocks[b['id']] = copy
+                    if candidate_blocks:
+                        pos, changed, cbounds, scale, accepted = fit(candidate)
+                        if accepted and scale > factor+1e-8:
+                            positions, moved, bounds, factor, readable = pos, changed, cbounds, scale, True
+                            measured = candidate
+                            compacted = sorted(candidate_blocks)
+                            for b in members:
+                                if b['id'] in candidate_blocks:
+                                    b['local_layout'] = candidate_blocks[b['id']]['local_layout']
+                x0,y0,x1,y1 = bounds
+                total_factor = factor*page_factor
+                if not readable:
+                    raise ValueError(f'区域 {frame["id"]} 需要缩放至 {total_factor:.3f}，超过可读下限；需校对样式或区域，未挤入其他大区域')
+                target = [ox+box[0]*page_factor,oy+box[1]*page_factor,
+                          ox+box[2]*page_factor,oy+box[3]*page_factor]
+                frames.append(dict(id=frame['id'],source_page_id=page['id'],page_index=page_index,
+                                   bbox=target,source_bbox_pt=box,block_ids=list(identifiers),kind=frame['kind']))
+                member_scales={identifier:factor for identifier in identifiers}
+                preserved=[]
+                if policy.get('four_layer'):
+                    positions,member_scales,preserved=_restore_clear_text_anchors(
+                        members,measured,positions,factor,box,moved,relations.get('attachments',[]))
+                adjustment = dict(frame_id=frame['id'],uniform_scale=total_factor,region_scale=factor,
+                                  page_scale=page_factor,moved_block_ids=moved,
+                                  source_bbox_pt=box,target_bbox=target,local_content_bounds=[x0,y0,x1,y1])
+                if preserved:
+                    adjustment.update(source_anchor_restored_ids=preserved,member_region_scales=member_scales)
+                if solver_diagnostics:
+                    adjustment['solver']=deepcopy(solver_diagnostics)
+                if compacted:
+                    adjustment.update(envelope_compaction=dict(
+                        reason='region-overflow-uniform-fit-below-readable-floor',
+                        first_region_scale=first_factor, block_ids=compacted,
+                        scope='unused-trailing-text-envelope-only'))
+                adjustments.append(adjustment)
+                if factor < 1.-1e-8 or moved:
+                    issues.append(dict(frame_id=frame['id'],reason='region-local-adaptation',uniform_scale=total_factor))
+                for identifier in identifiers:
+                    member_factor=member_scales[identifier]*page_factor
+                    m = scale_measurement(measured[identifier], member_factor)
+                    position_factor=page_factor if policy.get('four_layer') else total_factor
+                    x = target[0]+(positions[identifier][0]-x0)*position_factor
+                    y = target[1]+(positions[identifier][1]-y0)*position_factor
+                    kind = by_id[identifier]['kind']
+                    content_range = (dict(start=0,end=len(by_id[identifier]['content'].get('text','')))
+                                     if kind=='text' else dict(row_start=0,row_end=by_id[identifier]['content']['row_count'])
+                                     if kind=='table' else dict(whole=True))
+                    placements.append(dict(fragment_id=identifier+'-fragment-1',block_id=identifier,page_index=page_index,
+                                           bbox=[x,y,x+m['width'],y+m['height']],measurement=m,
+                                           content_range=content_range,repeat_header=False,frame_id=frame['id'],
+                                           source_transform=[member_factor,0.,0.,member_factor,
+                                                             x-image_source_bbox(by_id[identifier])[0]*member_factor,
+                                                             y-image_source_bbox(by_id[identifier])[1]*member_factor]))
+            except ValueError as exc:
+                if not recoverable_geometry_error(exc):
+                    raise
+                failure = RegionLayoutError(str(exc), frame, page)
+                failure.measurements = deepcopy(measured)
+                failure.positions = deepcopy(positions)
+                failure.solver_diagnostics = deepcopy(getattr(exc,'solver_diagnostics',{}))
+                if policy.get('text_adaptation_version') in {'20261103','20261104'}:
+                    from .layout_pending import save_layout_issue,diagnostic_root
+                    failure.positions=deepcopy(getattr(exc,'positions',positions))
+                    diagnostic=save_layout_issue(project, diagnostic_root.get(), failure)
+                    # Keep completed regions intact. Freeze this region's last
+                    # measured geometry; never rasterise or block later pages.
+                    target=[ox+box[0]*page_factor,oy+box[1]*page_factor,
+                            ox+box[2]*page_factor,oy+box[3]*page_factor]
+                    frames.append(dict(id=frame['id'],source_page_id=page['id'],page_index=page_index,
+                        bbox=target,source_bbox_pt=box,block_ids=list(identifiers),kind=frame['kind'],
+                        unresolved_geometry=True))
+                    issue=dict(frame_id=frame['id'],source_page_id=page['id'],
+                        physical_page_number=page.get('physical_page_index',0)+1,
+                        reason=str(exc),action='export-current-geometry-and-continue',
+                        block_ids=list(identifiers),solver=failure.solver_diagnostics,
+                        diagnostic_asset='layout-diagnostics/'+diagnostic.name if diagnostic else None)
+                    issues.append(issue)
+                    positions=getattr(exc,'positions',positions)
+                    for identifier in identifiers:
+                        b=by_id[identifier]
+                        sb=image_source_bbox(b)
+                        m=measured.get(identifier) or measure_block(b,sb[2]-sb[0])
+                        m=scale_measurement(m,page_factor)
+                        pos=positions.get(identifier,[sb[0]-box[0],sb[1]-box[1]])
+                        x,y=target[0]+pos[0]*page_factor,target[1]+pos[1]*page_factor
+                        kind=b['kind']
+                        content_range=(dict(start=0,end=len(b['content'].get('text',''))) if kind=='text'
+                            else dict(row_start=0,row_end=b['content']['row_count']) if kind=='table' else dict(whole=True))
+                        placements.append(dict(fragment_id=identifier+'-fragment-1',block_id=identifier,
+                            page_index=page_index,bbox=[x,y,x+m['width'],y+m['height']],measurement=m,
+                            content_range=content_range,repeat_header=False,frame_id=frame['id'],
+                            unresolved_geometry=True))
+                    continue
+                raise failure from exc
     if assigned != set(by_id):
         raise ValueError('区域未完整且唯一覆盖所有顶层模块')
+    from .table_image_binding import bind_table_images
+    bind_table_images(blocks, placements)
+    # A diagnostic canvas exposes overflow without scaling or cropping it.
+    for spec in pages:
+        visible=[p for p in placements if p['page_index']==spec['index']]
+        if not any(p.get('unresolved_geometry') for p in visible):
+            continue
+        left=min(0.,*(p['bbox'][0] for p in visible))
+        top=min(0.,*(p['bbox'][1] for p in visible))
+        right=max(spec['width'],*(p['bbox'][2] for p in visible))
+        bottom=max(spec['height'],*(p['bbox'][3] for p in visible))
+        if [left,top,right,bottom] == [0.,0.,spec['width'],spec['height']]:
+            continue
+        spec['diagnostic_canvas']=dict(original_size=[spec['width'],spec['height']],offset=[-left,-top])
+        spec.update(width=right-left,height=bottom-top)
+        for p in visible+[f for f in frames if f['page_index']==spec['index']]:
+            p['original_bbox']=list(p['bbox'])
+            p['bbox']=[v-(left if n%2==0 else top) for n,v in enumerate(p['bbox'])]
+            if 'source_transform' in p:
+                p['source_transform'][4]-=left;p['source_transform'][5]-=top
     rank = {i:n for n,i in enumerate(resolved)}
     placements.sort(key=lambda p:rank[p['block_id']])
     changes = [dict(block_id=i,source_index=order.index(i),target_index=n,

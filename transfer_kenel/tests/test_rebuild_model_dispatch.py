@@ -88,6 +88,37 @@ class TypedModelTests(unittest.TestCase):
         self.assertEqual(self.rec_inputs,[])
         self.assertEqual(result['layout_det_res']['boxes'][0]['label'],'formula')
 
+    def test_native_table_survives_paused_content_and_overlap_gate(self):
+        model=self.pipeline()
+        native_html='<table><tr><td>Native text</td><td>Second cell</td></tr></table>'
+        def table(image,**kwargs):
+            yield {'table_res_list':[dict(pred_html=native_html,
+                cell_box_list=[[0,0,60,40],[40,0,80,40]])]}
+        model.table_recognition_pipeline=table
+        result=recognize_rebuild(np.zeros((80,80,3),dtype=np.uint8),model)
+        self.assertEqual(len(result['table_res_list']),1)
+        published=result['table_res_list'][0]
+        self.assertEqual(published['pred_html'],native_html)
+        self.assertEqual(published['cell_box_list'],[[0.,40.,60.,80.],[40.,40.,80.,80.]])
+        self.assertEqual(published['validation_policy'],'native-v3-specialized-validation-paused')
+        self.assertNotIn('reconstruction_evidence',published)
+        self.assertTrue(any(d['reason']=='table-native-result-specialized-validation-paused'
+                            for d in result['diagnostics']))
+
+    def test_region_expansion_uses_actual_detector_keyword_and_is_reported(self):
+        model=self.pipeline()
+        calls=[]
+        original=model.region_detection_model
+        def regions(image,**kwargs):
+            calls.append(kwargs)
+            return original(image,**kwargs)
+        model.region_detection_model=regions
+        answer=recognize_rebuild(np.zeros((80,80,3),dtype=np.uint8),model,region_unclip_ratio=1.03)
+        self.assertEqual(calls[0]['layout_unclip_ratio'],1.03)
+        self.assertEqual(answer['region_det_res']['unclip_ratio'],1.03)
+        with self.assertRaises(ValueError):
+            recognize_rebuild(np.zeros((80,80,3),dtype=np.uint8),model,region_unclip_ratio=1.3)
+
     def test_page_mapping_preserves_crop_local_float_polygons_for_tables(self):
         polygons=np.array([[[2.,2.],[30.,2.],[30.,12.],[2.,12.]]])
         polygons.setflags(write=False)
@@ -125,7 +156,7 @@ class TypedModelTests(unittest.TestCase):
         self.assertTrue(any(d.get('block_id')=='layout-2' and
                             d['reason']=='fully-owned-by-another-block' for d in result['diagnostics']))
 
-    def test_occluded_table_never_claims_complete_recovered_structure(self):
+    def test_contained_image_does_not_block_table_structure(self):
         model=self.pipeline()
         def layout(image):
             yield {'boxes':[dict(label='image',coordinate=[0,0,20,40]),
@@ -134,14 +165,40 @@ class TypedModelTests(unittest.TestCase):
         model.general_ocr_pipeline.text_det_model=lambda image,**kwargs:iter([
             {'dt_polys':np.array([[[30,45],[60,45],[60,55],[30,55]]])}])
         result=recognize_rebuild(np.zeros((80,80,3),dtype=np.uint8),model)
-        self.assertEqual(self.table_inputs,[])
-        self.assertEqual(result['table_res_list'],[])
+        self.assertEqual(len(self.table_inputs),1)
+        self.assertEqual(len(result['table_res_list']),1)
         evidence=result['block_ownership']['layout-1']
         self.assertEqual(evidence['excluded_block_ids'],['layout-0'])
         self.assertEqual(evidence['excluded_rects'],[[0,0,20,40]])
         self.assertEqual(evidence['owned_pixel_count'],5600)
-        diagnostic=next(d for d in result['diagnostics'] if d['reason']=='table-overlap-image-fallback')
-        self.assertEqual(diagnostic['excluded_pixel_count'],800)
+        diagnostic=next(d for d in result['diagnostics'] if d['reason']=='table-contained-blocks-accepted')
+        self.assertEqual(diagnostic['contained_ids'],['layout-0'])
+        self.assertEqual(result['source_containment']['nodes']['layout-1']['contained_ids'],['layout-0'])
+
+    def test_crossing_image_still_blocks_table_structure(self):
+        model=self.pipeline()
+        model.layout_det_model=lambda image:iter([{'boxes':[
+            dict(label='image',coordinate=[0,0,20,40]),
+            dict(label='table',coordinate=[10,0,80,80])]}])
+        model.general_ocr_pipeline.text_det_model=lambda image,**kwargs:iter([
+            {'dt_polys':np.array([[[30,45],[60,45],[60,55],[30,55]]])}])
+        result=recognize_rebuild(np.zeros((80,80,3),dtype=np.uint8),model)
+        self.assertEqual(self.table_inputs,[])
+        self.assertEqual(result['table_res_list'],[])
+        self.assertTrue(any(d['reason']=='table-overlap-image-fallback' for d in result['diagnostics']))
+
+    def test_contained_formula_ocr_conflict_does_not_skip_table(self):
+        model=self.pipeline()
+        model.layout_det_model=lambda image:iter([{'boxes':[
+            dict(label='formula',coordinate=[20,10,40,20]),
+            dict(label='table',coordinate=[0,0,80,80])]}])
+        model.general_ocr_pipeline.text_det_model=lambda image,**kwargs:iter([
+            {'dt_polys':np.array([[[2,10],[60,10],[60,20],[2,20]],
+                                 [[2,45],[60,45],[60,55],[2,55]]])}])
+        result=recognize_rebuild(np.zeros((80,80,3),dtype=np.uint8),model)
+        self.assertTrue(any(d['reason']=='ocr-line-crosses-visual-block' for d in result['diagnostics']))
+        self.assertEqual(len(self.table_inputs),1)
+        self.assertFalse(any(d['reason']=='table-ocr-conflict-image-fallback' for d in result['diagnostics']))
 
     def test_new_operation_cache_is_separate_and_preserves_region_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -178,6 +235,22 @@ class TypedModelTests(unittest.TestCase):
         self.assertEqual(result['table_res_list'],[])
         diagnostic=next(d for d in result['diagnostics'] if d['reason']=='table-empty-ocr-image-fallback')
         self.assertEqual(diagnostic['block_id'],'layout-0')
+
+    def test_containment_scale_is_forwarded_and_separates_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config=load_config();config.update(results_dir=temporary)
+            runtime=NativeRuntime(config);runtime.pipeline=self.pipeline()
+            stream=io.BytesIO();Image.new('RGB',(80,80),'black').save(stream,format='PNG')
+            request=dict(id='scale',op='recognize_rebuild',pngBase64=base64.b64encode(stream.getvalue()).decode())
+            first=handle_request(runtime,request)
+            request['pixelToPoint']=[1.,.25]
+            second=handle_request(runtime,request)
+            self.assertFalse(second['cacheHit'])
+            self.assertEqual(first['result']['source_containment']['tolerance_px'],[2.,2.])
+            self.assertEqual(second['result']['source_containment']['tolerance_px'],[1.,4.])
+            self.assertTrue(handle_request(runtime,request)['cacheHit'])
+            request['pixelToPoint']=[0,1]
+            with self.assertRaises(ValueError):handle_request(runtime,request)
 
 
 if __name__=='__main__':

@@ -23,7 +23,8 @@ MAX_BATCH_SIZE = 8
 MAX_PADDED_PIXELS = 614400
 MAX_PADDING_RATIO = 1.5
 MIN_OWNER_COVERAGE = .5
-MIN_COMPLETE_COVERAGE = .98
+MIN_REVERSE_OWNER_COVERAGE = .9
+MIN_COMPLETE_COVERAGE = .80
 MAX_OWNER_EDGE_TOLERANCE = 12.
 
 
@@ -112,7 +113,7 @@ def _empty_result(crop, det_params, threshold):
                 textline_orientation_angles=[])
 
 
-def recognize_blocks(bgr, pipeline, ordered, block_ownership, diagnostics):
+def recognize_blocks(bgr, pipeline, ordered, block_ownership, diagnostics, *, cached_ocr=None):
     """Return page records, real per-block OCRResults and JSON-safe audit data."""
     from shapely.geometry import Polygon, box as rectangle
     from shapely.ops import unary_union
@@ -127,7 +128,8 @@ def recognize_blocks(bgr, pipeline, ordered, block_ownership, diagnostics):
                       unclip_ratio=float(getattr(ocr, 'text_det_unclip_ratio', 1.5)))
     threshold = float(getattr(ocr, 'text_rec_score_thresh', 0.))
     with span('v3.rebuild.text_det', backend='native'):
-        detections = _consume(ocr.text_det_model(bgr, **det_params))
+        detections = ([dict(dt_polys=cached_ocr['dt_polys'])] if cached_ocr is not None else
+                      _consume(ocr.text_det_model(bgr, **det_params)))
     if len(detections) != 1:
         raise ValueError('Full-page text detector must return exactly one result')
     raw_polys = detections[0].get('dt_polys')
@@ -152,7 +154,25 @@ def recognize_blocks(bgr, pipeline, ordered, block_ownership, diagnostics):
         if owned.is_empty:
             continue
         padding = MAX_OWNER_EDGE_TOLERANCE if block['label'] not in {'table','image'} else 0
-        crop, x0, y0 = _masked_crop(bgr, block, evidence, blockers, padding)
+        sampling = list(block['coordinate'])
+        if block['label'] not in {'table','image'}:
+            # Extend sampling, never the frozen layout detection. A tiny block
+            # can be inside a det polygon much larger than the old 12px pad.
+            for raw_poly in raw_polys:
+                poly = np.asarray(raw_poly, dtype=float)
+                if poly.shape != (4,2) or not np.isfinite(poly).all():
+                    continue
+                shape = Polygon(poly).intersection(page_rect)
+                if not shape.is_valid or shape.area <= .1:
+                    continue
+                intersection = shape.intersection(owned).area
+                block_area = rectangle(*block['coordinate']).intersection(page_rect).area
+                if (intersection > 0 and intersection/shape.area < MIN_OWNER_COVERAGE and
+                        block_area > 0 and intersection/block_area >= MIN_REVERSE_OWNER_COVERAGE):
+                    bounds = shape.bounds
+                    sampling = [min(sampling[0],bounds[0]),min(sampling[1],bounds[1]),
+                                max(sampling[2],bounds[2]),max(sampling[3],bounds[3])]
+        crop, x0, y0 = _masked_crop(bgr, dict(block, coordinate=sampling), evidence, blockers, padding)
         if crop.size == 0:
             continue
         candidates.append((priority, block, owned))
@@ -199,6 +219,20 @@ def recognize_blocks(bgr, pipeline, ordered, block_ownership, diagnostics):
             assignment.update(block_id=owner['id'], label=owner['label'], owner_coverage=float(coverage))
         else:
             owner = None
+            reverse = []
+            for forward, priority, candidate in overlaps:
+                if forward <= 0 or forward >= MIN_OWNER_COVERAGE or candidate['label'] in {'table','image'}:
+                    continue
+                # Divide by the original block, not an excluded ownership sliver.
+                block_area = rectangle(*candidate['coordinate']).intersection(page_rect).area
+                value = forward*geometry.area/block_area if block_area > 0 else 0.
+                if value >= MIN_REVERSE_OWNER_COVERAGE:
+                    reverse.append((value,forward,candidate))
+            assignment['reverse_candidates'] = [dict(block_id=b['id'],coverage=r) for r,_,b in reverse]
+            if len(reverse) == 1:
+                reverse_coverage,coverage,owner = reverse[0]
+                assignment.update(block_id=owner['id'],label=owner['label'],owner_coverage=float(coverage),
+                    reverse_owner_coverage=float(reverse_coverage),assignment_method='low-forward-reverse-coverage')
         visual_ids = [identifier for identifier, shape in visual
                       if geometry.intersection(shape).area > 1e-6]
         if owner is not None and owner['label'] == 'image' and coverage >= MIN_COMPLETE_COVERAGE:
@@ -219,8 +253,8 @@ def recognize_blocks(bgr, pipeline, ordered, block_ownership, diagnostics):
             diagnostics.append(dict(reason='ocr-line-unmatched-block', line_id=line_id,
                                     candidate_ids=candidate_ids, polygon=poly.tolist(), box=bounds))
             continue
-        tolerated = False
-        if coverage < MIN_COMPLETE_COVERAGE and owner['label'] not in {'table','image'} and len(candidate_ids) == 1:
+        tolerated = assignment.get('assignment_method') == 'low-forward-reverse-coverage'
+        if not tolerated and coverage < MIN_COMPLETE_COVERAGE and owner['label'] not in {'table','image'} and len(candidate_ids) == 1:
             # Layout boxes describe a paragraph, while det polygons include
             # their own border expansion. Small edge differences alone are
             # not ambiguity between blocks. Do not relax visual exclusions
@@ -259,6 +293,12 @@ def recognize_blocks(bgr, pipeline, ordered, block_ownership, diagnostics):
     sampler = getattr(recognizer, 'batch_sampler', None)
     previous_batch_size = getattr(sampler, 'batch_size', None)
     records = []
+    cached_lines = {}
+    if cached_ocr is not None:
+        for item in cached_ocr.get('records',[]):
+            key=tuple(np.asarray(item['polygon'],dtype=float).round(6).ravel())
+            cached_lines[key]=dict(rec_text=item['text'],rec_score=item['score'])
+    reused = 0
     try:
         for batch, widths in _batches(pending, dimensions):
             normalized_width = max(widths)
@@ -270,8 +310,16 @@ def recognize_blocks(bgr, pipeline, ordered, block_ownership, diagnostics):
             with span('v3.rebuild.text_rec_batch', backend='native', lineCount=len(batch),
                       normalizedWidth=normalized_width, paddedPixels=batch_info['padded_pixels'],
                       paddingRatio=batch_info['padding_ratio']):
-                results = _consume(recognizer([v['image'] for v in batch],
-                                             batch_size=len(batch), return_word_box=False))
+                results = [cached_lines.get(tuple(v['polygon'].astype(float).round(6).ravel())) for v in batch]
+                missing = [i for i,value in enumerate(results) if value is None]
+                if missing:
+                    fresh = _consume(recognizer([batch[i]['image'] for i in missing],
+                        batch_size=len(missing), return_word_box=False))
+                    if len(fresh) != len(missing):
+                        raise ValueError('Text recognizer result count does not match scheduled line batch')
+                    for i,value in zip(missing,fresh):results[i]=value
+                reused += len(batch)-len(missing)
+                batch_info.update(reusedLineCount=len(batch)-len(missing),inferredLineCount=len(missing))
             if len(results) != len(batch):
                 raise ValueError('Text recognizer result count does not match scheduled line batch')
             for value, result in zip(batch, results):
@@ -307,5 +355,7 @@ def recognize_blocks(bgr, pipeline, ordered, block_ownership, diagnostics):
         local_results[identifier] = _ocr_result(local)
     records.sort(key=lambda value: line_order[value['line_id']])
     info['acceptedLineCount'] = len(records)
+    info['reusedRecognitionLineCount'] = reused
+    info['reusedTextDetection'] = cached_ocr is not None
     info['matchedLineCount'] = len(pending)
     return records, local_results, info

@@ -104,7 +104,9 @@ def test_textured_image_has_metadata_transcript_and_no_extra_pdf_text(tmp_path):
     path,d=export_project(project(blocks,page),tmp_path)
     assert d['editableCharacterCount']==0
     with fitz.open(path) as pdf:
-        assert pdf[0].get_text()=='' and len(pdf[0].get_images())==1
+        assert pdf[0].get_text()==''
+        # Source pixels outside detected content are a separate page background.
+        assert len(pdf[0].get_images())==1+int(bool(page.get('background')))
         embedded=json.loads(pdf.embfile_get('rebuild-project.json'))
         assert embedded['blocks'][0]['content']['transcript'][0]['text']=='Heading'
 
