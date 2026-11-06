@@ -42,6 +42,7 @@ logs/
 .DS_Store
 Thumbs.db
 Desktop.ini
-/docs/DEVELOPMENT_LOG.md
-/docs/log/
-/docs/skills/
+# Local collaboration instructions and documentation
+AGENTS.md
+agent.md
+/docs/

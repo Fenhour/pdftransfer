@@ -8,6 +8,8 @@
 | 可编辑 PDF → Markdown | Markdown、图片资源与源 PDF 的 ZIP 包 |
 | 图片 / 扫描 PDF → 可编辑 PDF | 可搜索、可选择和可编辑的文字，保留版面与原图参考 |
 
+可编辑 PDF 转换直接读取原生文字、坐标、图片与表格；扫描件转换在本机完成版面分析、文字识别和表格结构提取，再按原页面布局重建 PDF。扫描任务支持后台排队和逐页预览，刷新网页不会中断转换。
+
 ## 安装
 
 支持 Windows 10 / 11，使用 Python 3.12（64位）和 Git。首次安装需要联网下载依赖与官方模型；转换在本机 CPU 运行，无需 Docker、云服务或 API 密钥。
@@ -54,5 +56,3 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -Port 8766
 ```powershell
 .\services\structure_v3\.venv\Scripts\python.exe -X utf8 services/structure_v3/prepare_models.py --check
 ```
-
-[转换流程](docs/ARCHITECTURE.md) · [开发与验证](docs/DEVELOPMENT.md)
